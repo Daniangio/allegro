@@ -10,7 +10,9 @@ else:
 from nequip.data import register_fields
 
 EDGE_ENERGY: Final[str] = "edge_energy"
+EDGE_FORCES: Final[str] = "edge_forces"
 EDGE_FEATURES: Final[str] = "edge_features"
+CURL: Final[str] = "curl"
 
 
 register_fields(edge_fields=[EDGE_ENERGY, EDGE_FEATURES])

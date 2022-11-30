@@ -117,3 +117,36 @@ class EdgewiseEnergySum(GraphModuleMixin, torch.nn.Module):
         data[AtomicDataDict.PER_ATOM_ENERGY_KEY] = atom_eng
 
         return data
+
+
+class EdgewiseForcesSum(GraphModuleMixin, torch.nn.Module):
+    """Sum edgewise forces.
+
+    """
+
+    _factor: Optional[float]
+
+    def __init__(
+        self,
+        irreps_in={},
+    ):
+        """Sum edges into nodes."""
+        super().__init__()
+        self._init_irreps(
+            irreps_in=irreps_in,
+            my_irreps_in={_keys.EDGE_FORCES: "1o"},
+            irreps_out={AtomicDataDict.FORCE_KEY: "1o"},
+        )
+
+    def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
+        edge_center = data[AtomicDataDict.EDGE_INDEX_KEY][0]
+
+        edge_f = data[_keys.EDGE_FORCES]
+        species = data[AtomicDataDict.ATOM_TYPE_KEY].squeeze(-1)
+
+        atom_f = scatter(edge_f, edge_center, dim=0, dim_size=len(species))
+
+        data[AtomicDataDict.FORCE_KEY] = atom_f
+        data[AtomicDataDict.PER_ATOM_ENERGY_KEY] = atom_f.sum(dim=-1, keepdim=True)
+
+        return data
