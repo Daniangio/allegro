@@ -3,8 +3,9 @@ import logging
 
 from e3nn import o3
 
-from nequip.data import AtomicDataDict, AtomicDataset
+from torch.utils.data import ConcatDataset
 
+from nequip.data import AtomicDataDict
 from nequip.nn import SequentialGraphNetwork, AtomwiseReduce
 from nequip.nn.radial_basis import BesselBasis
 
@@ -25,7 +26,7 @@ from allegro._keys import EDGE_FEATURES, EDGE_FORCES
 from nequip.model import builder_utils
 
 
-def AllegroGDML(config, initialize: bool, dataset: Optional[AtomicDataset] = None):
+def AllegroGDML(config, initialize: bool, dataset: Optional[ConcatDataset] = None):
     logging.debug("Building Allegro model...")
 
     # Handle avg num neighbors auto

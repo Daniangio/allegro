@@ -3,10 +3,11 @@ import logging
 
 from e3nn import o3
 
-from nequip.data import AtomicDataDict, AtomicDataset
-
+from nequip.data import AtomicDataDict
 from nequip.nn import SequentialGraphNetwork, AtomwiseReduce
 from nequip.nn.radial_basis import BesselBasis
+
+from torch.utils.data import ConcatDataset
 
 from nequip.nn.embedding import (
     OneHotAtomEncoding,
@@ -25,7 +26,7 @@ from allegro._keys import EDGE_FEATURES, EDGE_ENERGY
 from nequip.model import builder_utils
 
 
-def Allegro(config, initialize: bool, dataset: Optional[AtomicDataset] = None):
+def Allegro(config, initialize: bool, dataset: Optional[ConcatDataset] = None):
     logging.debug("Building Allegro model...")
 
     # Handle avg num neighbors auto

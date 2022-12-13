@@ -1,8 +1,8 @@
-import random
-from typing import List, Union, Optional
+from typing import List, Tuple, Union, Optional
 
 import torch
 
+from e3nn.o3 import Irreps
 from e3nn.util.jit import compile_mode
 
 from nequip.data import AtomicDataDict
@@ -23,59 +23,57 @@ class CurlOutput(GraphModuleMixin, torch.nn.Module):
         self,
         func: GraphModuleMixin,
         of: str,
-        wrt: Union[str, List[str]],
+        wrt: str,
         out_field: str,
-        deployed: bool = False
     ):
         super().__init__()
-        self.deployed = deployed
         self.of = of
-
-        # TO DO: maybe better to force using list?
-        if isinstance(wrt, str):
-            wrt = [wrt]
         self.wrt = wrt
-        self.func = func
         self.out_field = out_field
+        self.func = func
 
         # check and init irreps
         self._init_irreps(
             irreps_in=func.irreps_in,
+            my_irreps_in={of: Irreps("1o")},
             irreps_out=func.irreps_out,
         )
 
         # The gradient of a single scalar w.r.t. something of a given shape and irrep just has that shape and irrep
         # Ex.: gradient of energy (0e) w.r.t. position vector (L=1) is also an L = 1 vector
         self.irreps_out.update(
-            {f: self.irreps_in[wrt] for f, wrt in zip(self.out_field, self.wrt)}
+            {
+                self.out_field: self.irreps_in[self.wrt]
+            }
         )
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
-        if self.deployed:
-            return data
+        if self.production:
+            return self.func(data)
+        return self.forward_impl(data)
 
+    @torch.jit.unused
+    def forward_impl(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         # set req grad
-        wrt_tensors = []
-        old_requires_grad: List[bool] = []
-        for k in self.wrt:
-            old_requires_grad.append(data[k].requires_grad)
-            data[k].requires_grad_(True)
-            wrt_tensors.append(data[k])
+        old_requires_grad = data[self.wrt].requires_grad
+        data[self.wrt].requires_grad_(True)
+        wrt_tensors = data[self.wrt]
         # run func
         data = self.func(data)
         out = data[self.of]
 
-        external_grads_list = []
-        for i in random.sample(range(len(out)), int(0.1 * len(out))):
-            external_grad = torch.zeros_like(out)
+        external_grads_list: List[Tuple[int, torch.Tensor]] = []
+        # for i in random.sample(torch.tensor(list(range(len(out)))), torch.tensor(0.1 * len(out), dtype=torch.int)):
+        for i in torch.randint(0, len(out), (data[AtomicDataDict.BATCH_KEY].max().item() + 1,)):
+            external_grad: torch.Tensor = torch.zeros_like(out)
             external_grad[i, 0] = 1.
-            external_grads_list.append((i, external_grad))
-            external_grad = torch.zeros_like(out)
+            external_grads_list.append((i.item(), external_grad))
+            external_grad: torch.Tensor = torch.zeros_like(out)
             external_grad[i, 1] = 1.
-            external_grads_list.append((i, external_grad))
-            external_grad = torch.zeros_like(out)
+            external_grads_list.append((i.item(), external_grad))
+            external_grad: torch.Tensor = torch.zeros_like(out)
             external_grad[i, 2] = 1.
-            external_grads_list.append((i, external_grad))
+            external_grads_list.append((i.item(), external_grad))
 
         grads_list: List[List[torch.Tensor]] = []
         triplet_list: List[torch.Tensor] = []
@@ -84,6 +82,7 @@ class CurlOutput(GraphModuleMixin, torch.nn.Module):
             grads = torch.autograd.grad(
                         [out],
                         wrt_tensors,
+                        create_graph=True,
                         retain_graph=True,
                         grad_outputs=grad_outputs,
                     )[0]
@@ -102,7 +101,6 @@ class CurlOutput(GraphModuleMixin, torch.nn.Module):
         data[self.out_field] = curl
 
         # unset requires_grad_
-        for req_grad, k in zip(old_requires_grad, self.wrt):
-            data[k].requires_grad_(req_grad)
+        data[self.wrt].requires_grad_(old_requires_grad)
 
         return data

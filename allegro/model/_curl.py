@@ -22,7 +22,6 @@ def ForcesCurlOutput(config, model: GraphModuleMixin) -> CurlOutput:
         of=AtomicDataDict.FORCE_KEY,
         wrt=AtomicDataDict.POSITIONS_KEY,
         out_field=CURL,
-        deployed=config.get("deployed", False)
     )
 
 

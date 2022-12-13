@@ -108,16 +108,17 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
 
         # for normalization of env embed sums
         # one per layer
-        self.register_buffer(
+        self.register_parameter(
             "env_sum_normalizations",
             # dividing by sqrt(N)
-            torch.as_tensor([avg_num_neighbors] * num_layers).rsqrt(),
+            torch.nn.Parameter(torch.as_tensor([avg_num_neighbors] * num_layers).rsqrt()),
         )
 
         latent = functools.partial(latent, **latent_kwargs)
         env_embed = functools.partial(env_embed, **env_embed_kwargs)
 
         self.latents = torch.nn.ModuleList([])
+        self.latents_to_weights = torch.nn.ModuleList([])
         self.env_embed_mlps = torch.nn.ModuleList([])
         self.tps = torch.nn.ModuleList([])
         self.linears = torch.nn.ModuleList([])
@@ -163,16 +164,17 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
 
                 ir_out = o3.Irreps(ir_out)
 
-            # if layer_idx == self.num_layers - 1:
-            #     # ^ means we're doing the last layer
-            #     # No more TPs follow this, so only need L=1 vectors
-            #     ir_out = o3.Irreps(
-            #     [
-            #         (mul, ir)
-            #         for mul, ir in ir_out
-            #         if tp_path_exists(arg_irreps, env_embed_irreps, ir) and ir.l == 1 and ir.p == -1
-            #     ]
-            # )
+            if layer_idx == self.num_layers - 1:
+                # ^ means we're doing the last layer
+                # No more TPs follow this, so only need L=1 vectors
+                ir_out = o3.Irreps(
+                [
+                    (mul, ir)
+                    for mul, ir in ir_out
+                    if tp_path_exists(arg_irreps, env_embed_irreps, ir) and 
+                    ((ir.l == 0 and ir.p == 1) or (ir.l == 1 and ir.p == -1))
+                ]
+            )
 
             # Prune impossible paths
             ir_out = o3.Irreps(
@@ -312,8 +314,8 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
                 Linear(
                     full_out_irreps,
                     out_irreps,
-                    shared_weights=True,
-                    internal_weights=True,
+                    shared_weights=False,
+                    internal_weights=False,
                     pad_to_alignment=pad_to_alignment,
                 )
             )
@@ -349,6 +351,19 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
                         mlp_output_dimension=None,
                     )
                 )
+            self.latents_to_weights.append(
+                latent(
+                    mlp_input_dimension=(
+                        (
+                            # the embedded latent invariants from the previous layer(s)
+                            self.latents[-1].out_features
+                            # and the invariants extracted from the last layer's TP:
+                            + env_embed_multiplicity * n_scalar_outs
+                        )
+                    ),
+                    mlp_output_dimension=self.linears[-1].weight_numel,
+                )
+            )
             
             # the env embed MLP takes the last latent's output as input
             # and outputs enough weights for the env embedder
@@ -372,7 +387,7 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
                     pad_to_alignment=pad_to_alignment,
                 )
         
-        self.final_latent = latent(
+        self.final_latent_to_weights = latent(
             mlp_input_dimension=self.latents[-1].out_features
             + env_embed_multiplicity * n_scalar_outs,
             mlp_output_dimension=self.final_linear.weight_numel,
@@ -512,8 +527,8 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
 
         # !!!! REMEMBER !!!! update final layer if update the code in main loop!!!
         # This goes through layer0, layer1, ..., layer_max-1
-        for latent, env_embed_mlp, env_linear, tp, linear in zip(
-            self.latents, self.env_embed_mlps, self.env_linears, self.tps, self.linears
+        for latent, latent_to_weights, env_embed_mlp, env_linear, tp, linear in zip(
+            self.latents, self.latents_to_weights, self.env_embed_mlps, self.env_linears, self.tps, self.linears
         ):
             # Determine which edges are still in play
             cutoff_coeffs = cutoff_coeffs_all[layer_index]
@@ -611,19 +626,13 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
             )
 
             # do the linear
-            features = linear(features)
-
-            # For layer2+, use the previous latents and scalars
-            # This makes it deep
-            # latent_inputs_to_cat = [
-            #     latents[active_edges],
-            # ]
-            # if layer_index < self.num_layers - 2:
-            #     latent_inputs_to_cat.append(scalars)
             latent_inputs_to_cat = [
                 latents[active_edges],
                 scalars,
             ]
+
+            linear_weights = latent_to_weights(torch.cat(latent_inputs_to_cat, dim=-1))
+            features = linear(features, w=linear_weights)
 
             # increment counter
             layer_index += 1
@@ -633,7 +642,7 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
         prev_mask = cutoff_coeffs[active_edges] > 0
         active_edges = (cutoff_coeffs > 0).nonzero().squeeze(-1)
 
-        linear_weights = self.final_latent(
+        linear_weights = self.final_latent_to_weights(
             torch.cat(latent_inputs_to_cat, dim=-1)[prev_mask]
         )
         linear_weights = cutoff_coeffs[active_edges].unsqueeze(-1) * linear_weights
