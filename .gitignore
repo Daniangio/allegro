@@ -4,6 +4,10 @@ wandb/
 benchmark_data/
 .idea/
 results/
+lammps_run/
+configs/
+data/
+deployed/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
