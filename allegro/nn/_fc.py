@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Callable, List, Optional
 import math
 
 import torch
@@ -12,6 +12,8 @@ from e3nn.math import normalize2mom
 from nequip.data import AtomicDataDict
 from nequip.nn import GraphModuleMixin
 from nequip.nn.nonlinearities import ShiftedSoftPlus
+
+from allegro._keys import EDGE_FEATURES
 
 
 @compile_mode("script")
@@ -167,3 +169,172 @@ class ScalarMLPFunction(CodeGenMixin, torch.nn.Module):
 
     def forward(self, x):
         return self._forward(x)
+
+
+@compile_mode("script")
+class ExponentialScalarMLP(GraphModuleMixin, torch.nn.Module):
+
+    field: str
+    out_field: str
+
+    def __init__(
+        self,
+        mlp_latent_dimensions: List[int],
+        mlp_output_dimension: Optional[int],
+        mlp_nonlinearity: Optional[str] = "silu",
+        mlp_initialization: str = "uniform",
+        mlp_dropout_p: float = 0.0,
+        mlp_batchnorm: bool = False,
+        field: str = AtomicDataDict.NODE_FEATURES_KEY,
+        out_field: Optional[str] = None,
+        irreps_in = None,
+        nonlinearity: Callable = torch.tanh,
+    ):
+        super().__init__()
+        self.nonlinearity = nonlinearity
+        self.field = field
+        self.out_field = out_field if out_field is not None else field
+
+        self._init_irreps(
+            irreps_in=irreps_in,
+            required_irreps_in=[self.field],
+        )
+        
+        assert len(self.irreps_in[self.field]) == 1
+        assert self.irreps_in[self.field][0].ir == (0, 1)  # scalars
+        in_dim = self.irreps_in[self.field][0].mul
+
+        self._module = ExponentialScalarMLPFunction(
+            mlp_input_dimension=in_dim,
+            mlp_latent_dimensions=mlp_latent_dimensions,
+            mlp_output_dimension=mlp_output_dimension,
+            mlp_nonlinearity=mlp_nonlinearity,
+            mlp_initialization=mlp_initialization,
+            mlp_dropout_p=mlp_dropout_p,
+            mlp_batchnorm=mlp_batchnorm,
+        )
+        
+        self.output_dimension = mlp_output_dimension or mlp_latent_dimensions[-1]
+        self.register_parameter(
+            "_amplitude",
+            torch.nn.Parameter(torch.ones(self._module.out_features,)),
+        )
+
+        self.irreps_out[self.out_field] = o3.Irreps(
+            [(self._module.out_features, (0, 1))]
+        )
+    
+    def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
+        data[self.out_field] = self._module(data[self.field])
+        return data
+
+
+@compile_mode("script")
+class ExponentialScalarMLPFunction(ScalarMLPFunction, torch.nn.Module):
+
+    def __init__(
+        self,
+        mlp_input_dimension: Optional[int],
+        mlp_latent_dimensions: List[int],
+        mlp_output_dimension: Optional[int],
+        mlp_nonlinearity: Optional[str] = "silu",
+        mlp_initialization: str = "normal",
+        mlp_dropout_p: float = 0.0,
+        mlp_batchnorm: bool = False,
+        nonlinearity: Callable = torch.tanh,
+    ):
+        super().__init__(
+            mlp_input_dimension=mlp_input_dimension,
+            mlp_latent_dimensions=[2*d for d in mlp_latent_dimensions],
+            mlp_output_dimension=2 * mlp_output_dimension if mlp_output_dimension is not None else None,
+            mlp_nonlinearity=mlp_nonlinearity,
+            mlp_initialization=mlp_initialization,
+            mlp_dropout_p=mlp_dropout_p,
+            mlp_batchnorm=mlp_batchnorm,
+        )
+        self.nonlinearity = nonlinearity
+
+        self.out_features = mlp_output_dimension or mlp_latent_dimensions[-1]
+        self.register_parameter(
+            "_amplitude",
+            torch.nn.Parameter(torch.ones(self.out_features,)),
+        )
+    
+    def forward(self, x):
+        x = self._forward(x)
+        weights = x.narrow(-1, 0, self.out_features)
+        exponents = x.narrow(-1, self.out_features, self.out_features)
+        exponents = torch.sqrt(torch.abs(self._amplitude)) * self.nonlinearity(exponents)
+        return weights * torch.exp(exponents)
+
+
+@compile_mode("script")
+class NBodyScalarMLP(GraphModuleMixin, torch.nn.Module):
+
+    field: str
+    out_field: str
+
+    def __init__(
+        self,
+        num_layers: int,
+        mlp_latent_dimensions: List[int],
+        mlp_output_dimension: Optional[int],
+        mlp_nonlinearity: Optional[str] = "silu",
+        mlp_initialization: str = "uniform",
+        mlp_dropout_p: float = 0.0,
+        mlp_batchnorm: bool = False,
+        field: str = EDGE_FEATURES,
+        out_field: Optional[str] = None,
+        irreps_in = None,
+        mlp_module: GraphModuleMixin = ExponentialScalarMLP,
+    ):
+        super().__init__()
+        self.field = field
+        self.out_field = out_field if out_field is not None else field
+        self.scalar_mlps = torch.nn.ModuleList([])
+
+        self._init_irreps(
+            irreps_in=irreps_in,
+            required_irreps_in=[self.field + f"_{layer}_body" for layer in range(1, num_layers)] + [self.field + "_inf_body"],
+        )
+
+        for layer in range(1, num_layers):
+            self.scalar_mlps.append(
+                mlp_module(
+                    mlp_latent_dimensions = mlp_latent_dimensions,
+                    mlp_output_dimension = mlp_output_dimension,
+                    mlp_nonlinearity = mlp_nonlinearity,
+                    mlp_initialization = mlp_initialization,
+                    mlp_dropout_p = mlp_dropout_p,
+                    mlp_batchnorm = mlp_batchnorm,
+                    field = self.field + f"_{layer}_body",
+                    out_field = self.out_field + "_temp",
+                    irreps_in=irreps_in,
+                )
+            )
+        
+        self.scalar_mlps.append(
+                mlp_module(
+                    mlp_latent_dimensions = mlp_latent_dimensions,
+                    mlp_output_dimension = mlp_output_dimension,
+                    mlp_nonlinearity = mlp_nonlinearity,
+                    mlp_initialization = mlp_initialization,
+                    mlp_dropout_p = mlp_dropout_p,
+                    mlp_batchnorm = mlp_batchnorm,
+                    field = self.field + f"_inf_body",
+                    out_field = self.out_field + "_temp",
+                    irreps_in=irreps_in,
+                )
+            )
+        
+        self.irreps_out[self.out_field] = o3.Irreps(
+            [(mlp_output_dimension, (0, 1))]
+        )
+    
+    def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
+        data = self.scalar_mlps[0](data)
+        data[self.out_field] = data.pop(self.out_field + "_temp")
+        for scalar_mlp in self.scalar_mlps[1:]:
+            data = scalar_mlp(data)
+            data[self.out_field] += data.pop(self.out_field + "_temp")
+        return data
