@@ -109,7 +109,7 @@ class EdgewiseEnergySum(GraphModuleMixin, torch.nn.Module):
                 center_species, neighbor_species
             ].unsqueeze(-1)
 
-        atom_eng = scatter(edge_eng, edge_center, dim=0, dim_size=len(species))
+        atom_eng = scatter(edge_eng, edge_center, dim=0, dim_size=len(species)) / torch.bincount(edge_center).unsqueeze(1)
         factor: Optional[float] = self._factor  # torchscript hack for typing
         if factor is not None:
             atom_eng = atom_eng * factor
