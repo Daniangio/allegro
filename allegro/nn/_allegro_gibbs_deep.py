@@ -1,4 +1,4 @@
-from typing import Optional, List, Tuple
+from typing import Optional, List
 import math
 import functools
 
@@ -16,26 +16,13 @@ from ._fc import ExponentialScalarMLPFunction
 from .. import _keys
 from ._strided import Contracter, MakeWeightedChannels, Linear
 from .cutoffs import cosine_cutoff, polynomial_cutoff
-
-
-@torch.jit.script
-def pad_and_stack(tensor: torch.Tensor, batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    longest_seq = int(batch.bincount().max().item())
-    n_batches = int(batch.max().item() + 1)
-
-    _, h, f = tensor.size()
-    tensor_padded = torch.zeros(longest_seq * n_batches, h, f, dtype=tensor.dtype, device=tensor.device)
-    orig_idcs: List[int] = []
-    for from_, b in zip(range(0, len(tensor_padded), longest_seq), range(0, n_batches)):
-        batch_elem = tensor[batch == b]
-        tensor_padded[from_:from_ + len(batch_elem)] = batch_elem
-        orig_idcs.extend(list(range(from_, from_ + len(batch_elem))))
-    return tensor_padded.reshape(n_batches, longest_seq, h, f), torch.tensor(orig_idcs, dtype=torch.long, device=tensor.device)
+from ._allegro_gibbs import pad_and_stack
 
 
 @compile_mode("script")
-class Allegro_Gibbs_Module(GraphModuleMixin, torch.nn.Module):
+class Allegro_Gibbs_Deep_Module(GraphModuleMixin, torch.nn.Module):
     # saved params
+    num_pre_layers: int
     num_layers: int
     field: str
     out_field: str
@@ -53,6 +40,7 @@ class Allegro_Gibbs_Module(GraphModuleMixin, torch.nn.Module):
     def __init__(
         self,
         # required params
+        num_pre_layers: int,
         num_layers: int,
         num_types: int,
         r_max: float,
@@ -94,6 +82,7 @@ class Allegro_Gibbs_Module(GraphModuleMixin, torch.nn.Module):
         assert (
             num_layers >= 1
         )  # zero layers is "two body", but we don't need to support that fallback case
+        self.num_pre_layers = num_pre_layers
         self.num_layers = num_layers
         self.nonscalars_include_parity = nonscalars_include_parity
         self.field = field
@@ -126,7 +115,15 @@ class Allegro_Gibbs_Module(GraphModuleMixin, torch.nn.Module):
         self.register_buffer(
             "env_sum_normalizations",
             # dividing by sqrt(N)
-            torch.as_tensor([avg_num_neighbors] * num_layers).rsqrt(),
+            torch.as_tensor([avg_num_neighbors] * (num_pre_layers + num_layers)).rsqrt(),
+        )
+
+        # for normalization of features
+        # one per layer
+        self.register_parameter(
+            "features_normalizations",
+            # dividing by sqrt(N)
+            torch.nn.Parameter(torch.as_tensor([avg_num_neighbors] * (num_pre_layers + num_layers)).rsqrt()),
         )
 
         latent = functools.partial(latent, **latent_kwargs)
@@ -166,7 +163,7 @@ class Allegro_Gibbs_Module(GraphModuleMixin, torch.nn.Module):
         # start to build up the irreps for the iterated TPs
         tps_irreps = [arg_irreps]
 
-        for layer_idx in range(num_layers):
+        for layer_idx in range(num_pre_layers + num_layers):
             # Create higher order terms cause there are more TPs coming
             if layer_idx == 0:
                 # Add parity irreps
@@ -182,7 +179,7 @@ class Allegro_Gibbs_Module(GraphModuleMixin, torch.nn.Module):
 
                 ir_out = o3.Irreps(ir_out)
 
-            if layer_idx == self.num_layers - 1:
+            if layer_idx == self.num_pre_layers + self.num_layers - 1:
                 # ^ means we're doing the last layer
                 # No more TPs follow this, so only need scalars
                 ir_out = o3.Irreps([(1, (0, 1))])
@@ -429,7 +426,7 @@ class Allegro_Gibbs_Module(GraphModuleMixin, torch.nn.Module):
             # note that the sigmoid of these are the factor _between_ layers
             # so the first entry is the ratio for the latent resnet of the first and second layers, etc.
             # e.g. if there are 3 layers, there are 2 ratios: l1:l2, l2:l3
-            latent_resnet_update_params = torch.zeros(self.num_layers)
+            latent_resnet_update_params = torch.zeros(self.num_pre_layers + self.num_layers)
         else:
             latent_resnet_update_ratios = torch.as_tensor(
                 latent_resnet_update_ratios, dtype=torch.get_default_dtype()
@@ -442,8 +439,8 @@ class Allegro_Gibbs_Module(GraphModuleMixin, torch.nn.Module):
             # The sigmoid is mostly saturated at ±6, keep it in a reasonable range
             latent_resnet_update_params.clamp_(-6.0, 6.0)
         assert latent_resnet_update_params.shape == (
-            num_layers,
-        ), f"There must be {num_layers} layer resnet update ratios (layer0:layer1, layer1:layer2)"
+            num_pre_layers + num_layers,
+        ), f"There must be {num_pre_layers + num_layers} layer resnet update ratios (layer0:layer1, layer1:layer2)"
         if latent_resnet_update_ratios_learnable:
             self._latent_resnet_update_params = torch.nn.Parameter(
                 latent_resnet_update_params
@@ -455,12 +452,12 @@ class Allegro_Gibbs_Module(GraphModuleMixin, torch.nn.Module):
 
         # - Per-layer cutoffs -
         if per_layer_cutoffs is None:
-            per_layer_cutoffs = torch.full((num_layers + 1,), r_max)
+            per_layer_cutoffs = torch.full((num_pre_layers + num_layers + 1,), r_max)
         self.register_buffer("per_layer_cutoffs", torch.as_tensor(per_layer_cutoffs))
         assert torch.all(self.per_layer_cutoffs <= r_max)
         assert self.per_layer_cutoffs.shape == (
-            num_layers + 1,
-        ), "Must be one per-layer cutoff for layer 0 and every layer for a total of {num_layers} cutoffs (the first applies to the two body latent, which is 'layer 0')"
+            num_pre_layers + num_layers + 1,
+        ), f"Must be one per-layer cutoff for layer 0 and every layer for a total of {num_pre_layers + num_layers} cutoffs (the first applies to the two body latent, which is 'layer 0')"
         assert (
             self.per_layer_cutoffs[1:] <= self.per_layer_cutoffs[:-1]
         ).all(), "Per-layer cutoffs must be equal or decreasing"
@@ -470,17 +467,13 @@ class Allegro_Gibbs_Module(GraphModuleMixin, torch.nn.Module):
         self._latent_dim = self.final_latent.out_features
         self.register_buffer("_zero", torch.as_tensor(0.0))
 
-        out_fields_irreps = o3.Irreps([(self.n_body_mlps[-1].out_features, (0, 1))])
-        out_fields = {
-            self.latent_out_field + f"_{layer}_body": out_fields_irreps for layer in range(1, num_layers)
-        }
-        out_fields[self.latent_out_field + "_inf_body"] = out_fields_irreps
-        self.irreps_out.update(out_fields)
+        out_fields = [self.latent_out_field + f"_{layer}_body" for layer in range(1, num_layers)] + [self.latent_out_field + "_inf_body"]
         self.irreps_out.update(
             {
                 self.latent_out_field: o3.Irreps(
                     [(self.final_latent.out_features, (0, 1))]
                 ),
+                **{k: v for k, v in zip(out_fields, [o3.Irreps([(self.n_body_mlps[-1].out_features, (0, 1))])] * len(out_fields))}
             }
         )
 
@@ -648,55 +641,56 @@ class Allegro_Gibbs_Module(GraphModuleMixin, torch.nn.Module):
 
             # Now do the TP
             # recursively tp current features with the environment embeddings
-            features = tp(features, local_env_per_edge)
+            features = tp(features, local_env_per_edge) * self.features_normalizations[layer_index]
 
             # Get invariants
             attention_scalars = features[:, :, : self._n_scalar_outs[layer_index]]
 
             # Attention mechanism
             # query, key, value have shape [z][mul][k_emb]
-            query_stacked = attention_query(attention_scalars)
-            key_stacked = attention_key(attention_scalars)
-            value_stacked = attention_value(attention_scalars)
+            if layer >= self.num_pre_layers:
+                query_stacked = attention_query(attention_scalars)
+                key_stacked = attention_key(attention_scalars)
+                value_stacked = attention_value(attention_scalars)
 
-            q, orig_idcs = pad_and_stack(query_stacked, active_edge_center)
-            k, _ = pad_and_stack(key_stacked, active_edge_center)
-            v, _ = pad_and_stack(value_stacked, active_edge_center)
+                q, orig_idcs = pad_and_stack(query_stacked, active_edge_center)
+                k, _ = pad_and_stack(key_stacked, active_edge_center)
+                v, _ = pad_and_stack(value_stacked, active_edge_center)
 
-            attention_score = torch.einsum('bihk, bkhl -> bilh', q, torch.transpose(k, 1, 3))
-            attention = torch.softmax(attention_score, dim=2)
-            attention_latent = torch.einsum('bijh, bjhk -> bihk', attention, v)
-            _, _, h, f = attention_latent.size()
-            attention_latent = attention_latent.reshape(-1, h, f)[orig_idcs]
+                attention_score = torch.einsum('bihk, bkhl -> bilh', q, torch.transpose(k, 1, 3))
+                attention = torch.softmax(attention_score, dim=2)
+                attention_latent = torch.einsum('bijh, bjhk -> bihk', attention, v)
+                _, _, h, f = attention_latent.size()
+                attention_latent = attention_latent.reshape(-1, h, f)[orig_idcs]
 
-            # # # queries = torch.tensor_split(query_stacked.cpu(), torch.cumsum(torch.bincount(edge_center[active_edges])[:-1], dim=0).cpu(), dim=0)
-            # # # keys = torch.tensor_split(key_stacked.cpu(), torch.cumsum(torch.bincount(edge_center[active_edges])[:-1], dim=0).cpu(), dim=0)
-            # # # values = torch.tensor_split(value_stacked.cpu(), torch.cumsum(torch.bincount(edge_center[active_edges])[:-1], dim=0).cpu(), dim=0)
-            # # # attention_latent = []
-            # # # for q, k, v in zip(queries, keys, values):
-            # # #     attention_score = torch.einsum('ihk, khl -> ilh', q.to(attention_scalars.device), torch.transpose(k.to(attention_scalars.device), 0, 2))
-            # # #     attention = torch.softmax(attention_score, dim=1)
-            # # #     attention_latent.append(torch.einsum('ijh, jhk -> ihk', attention, v.to(attention_scalars.device)))
-            # # # attention_latent = torch.cat(attention_latent, dim=0)
+                # # # queries = torch.tensor_split(query_stacked.cpu(), torch.cumsum(torch.bincount(edge_center[active_edges])[:-1], dim=0).cpu(), dim=0)
+                # # # keys = torch.tensor_split(key_stacked.cpu(), torch.cumsum(torch.bincount(edge_center[active_edges])[:-1], dim=0).cpu(), dim=0)
+                # # # values = torch.tensor_split(value_stacked.cpu(), torch.cumsum(torch.bincount(edge_center[active_edges])[:-1], dim=0).cpu(), dim=0)
+                # # # attention_latent = []
+                # # # for q, k, v in zip(queries, keys, values):
+                # # #     attention_score = torch.einsum('ihk, khl -> ilh', q.to(attention_scalars.device), torch.transpose(k.to(attention_scalars.device), 0, 2))
+                # # #     attention = torch.softmax(attention_score, dim=1)
+                # # #     attention_latent.append(torch.einsum('ijh, jhk -> ihk', attention, v.to(attention_scalars.device)))
+                # # # attention_latent = torch.cat(attention_latent, dim=0)
 
-            # Make n-body combinations across head dimension
-            if layer == 0:
-                n_body_features_update = attention_latent.reshape(attention_latent.shape[0], -1)
-            else:
-                attention_heads_idcs = torch.arange(attention_latent.shape[1]).to(attention_scalars.device)
-                n_body_head_comb_idcs = torch.combinations(attention_heads_idcs, r=layer+1)
+                # Make n-body combinations across head dimension
+                if layer == 0:
+                    n_body_features_update = attention_latent.reshape(attention_latent.shape[0], -1)
+                else:
+                    attention_heads_idcs = torch.arange(attention_latent.shape[1]).to(attention_scalars.device)
+                    n_body_head_comb_idcs = torch.combinations(attention_heads_idcs, r=layer+1)
 
-                n_body_features_update = attention_latent[:, n_body_head_comb_idcs]
-                n_body_features_update = torch.cat([n_body_features_update[..., h, :] for h in range(n_body_features_update.shape[2])], dim=-1)
-                n_body_features_update = n_body_features_update.reshape(n_body_features_update.shape[0], -1)
+                    n_body_features_update = attention_latent[:, n_body_head_comb_idcs]
+                    n_body_features_update = torch.cat([n_body_features_update[..., h, :] for h in range(n_body_features_update.shape[2])], dim=-1)
+                    n_body_features_update = n_body_features_update.reshape(n_body_features_update.shape[0], -1)
 
-            n_body_features = torch.zeros(
-                (num_edges, n_body_features_update.shape[-1]),
-                dtype=edge_attr.dtype,
-                device=edge_attr.device,
-            )
-            n_body_features[active_edges] = n_body_features_update
-            data[self.latent_out_field + f"_{layer + 1}_body"] = n_body_mlp(n_body_features)
+                n_body_features = torch.zeros(
+                    (num_edges, n_body_features_update.shape[-1]),
+                    dtype=edge_attr.dtype,
+                    device=edge_attr.device,
+                )
+                n_body_features[active_edges] = n_body_features_update
+                data[self.latent_out_field + f"_{layer - self.num_pre_layers + 1}_body"] = n_body_mlp(n_body_features)
 
             # Get invariants
             # features has shape [z][mul][k]

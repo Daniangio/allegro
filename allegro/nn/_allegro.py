@@ -73,7 +73,7 @@ class Allegro_Module(GraphModuleMixin, torch.nn.Module):
         irreps_in=None,
     ):
         super().__init__()
-        SCALAR = o3.Irrep("0e")  # define for convinience
+        SCALAR = o3.Irrep("0e")  # define for convenience
 
         # save parameters
         assert (
@@ -108,10 +108,13 @@ class Allegro_Module(GraphModuleMixin, torch.nn.Module):
 
         # for normalization of env embed sums
         # one per layer
+        env_sum_norm = []
+        for layer in range(num_layers + 1, 1, -1):
+            env_sum_norm.append(avg_num_neighbors ** (0.5 * math.sqrt(layer)))
         self.register_buffer(
             "env_sum_normalizations",
             # dividing by sqrt(N)
-            torch.as_tensor([avg_num_neighbors] * num_layers).rsqrt(),
+            torch.as_tensor(env_sum_norm).reciprocal(),
         )
 
         latent = functools.partial(latent, **latent_kwargs)

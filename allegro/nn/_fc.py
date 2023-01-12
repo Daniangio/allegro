@@ -265,7 +265,7 @@ class ExponentialScalarMLPFunction(ScalarMLPFunction, torch.nn.Module):
         weights = x.narrow(-1, 0, self.out_features)
         exponents = x.narrow(-1, self.out_features, self.out_features)
         exponents = torch.sqrt(torch.abs(self._amplitude)) * self.nonlinearity(exponents)
-        return weights * torch.exp(exponents)
+        return weights * torch.exp(exponents) / 2.718
 
 
 @compile_mode("script")
@@ -291,6 +291,7 @@ class NBodyScalarMLP(GraphModuleMixin, torch.nn.Module):
         super().__init__()
         self.field = field
         self.out_field = out_field if out_field is not None else field
+        self.mlp_output_dimension = mlp_output_dimension
         self.scalar_mlps = torch.nn.ModuleList([])
 
         self._init_irreps(
@@ -321,7 +322,7 @@ class NBodyScalarMLP(GraphModuleMixin, torch.nn.Module):
                     mlp_initialization = mlp_initialization,
                     mlp_dropout_p = mlp_dropout_p,
                     mlp_batchnorm = mlp_batchnorm,
-                    field = self.field + f"_inf_body",
+                    field = self.field + "_inf_body",
                     out_field = self.out_field + "_temp",
                     irreps_in=irreps_in,
                 )
@@ -332,9 +333,16 @@ class NBodyScalarMLP(GraphModuleMixin, torch.nn.Module):
         )
     
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
-        data = self.scalar_mlps[0](data)
-        data[self.out_field] = data.pop(self.out_field + "_temp")
-        for scalar_mlp in self.scalar_mlps[1:]:
+        out = torch.zeros(
+            (
+                len(data[self.field + "_inf_body"]),
+                self.mlp_output_dimension,
+            ),
+            dtype=data[self.field + "_inf_body"].dtype,
+            device=data[self.field + "_inf_body"].device
+        )
+        for scalar_mlp in self.scalar_mlps:
             data = scalar_mlp(data)
-            data[self.out_field] += data.pop(self.out_field + "_temp")
+            out = out + data[self.out_field + "_temp"]
+        data[self.out_field] = out
         return data
