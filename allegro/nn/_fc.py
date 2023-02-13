@@ -215,11 +215,6 @@ class ExponentialScalarMLP(GraphModuleMixin, torch.nn.Module):
         )
         
         self.output_dimension = mlp_output_dimension or mlp_latent_dimensions[-1]
-        self.register_parameter(
-            "_amplitude",
-            torch.nn.Parameter(torch.ones(self._module.out_features,)),
-        )
-
         self.irreps_out[self.out_field] = o3.Irreps(
             [(self._module.out_features, (0, 1))]
         )
@@ -242,6 +237,7 @@ class ExponentialScalarMLPFunction(ScalarMLPFunction, torch.nn.Module):
         mlp_dropout_p: float = 0.0,
         mlp_batchnorm: bool = False,
         nonlinearity: Callable = torch.tanh,
+        exp_function_normalization_constant: float = 0.5,
     ):
         super().__init__(
             mlp_input_dimension=mlp_input_dimension,
@@ -259,13 +255,17 @@ class ExponentialScalarMLPFunction(ScalarMLPFunction, torch.nn.Module):
             "_amplitude",
             torch.nn.Parameter(torch.ones(self.out_features,)),
         )
+        self.register_buffer(
+            "_exp_function_normalization_constant",
+            torch.tensor(exp_function_normalization_constant),
+        )
     
     def forward(self, x):
         x = self._forward(x)
         weights = x.narrow(-1, 0, self.out_features)
         exponents = x.narrow(-1, self.out_features, self.out_features)
-        exponents = torch.sqrt(torch.abs(self._amplitude)) * self.nonlinearity(exponents)
-        return weights * torch.exp(exponents) / 2.718
+        exponents = self._amplitude * self.nonlinearity(exponents)
+        return weights * torch.exp(exponents) * self._exp_function_normalization_constant
 
 
 @compile_mode("script")
@@ -296,10 +296,10 @@ class NBodyScalarMLP(GraphModuleMixin, torch.nn.Module):
 
         self._init_irreps(
             irreps_in=irreps_in,
-            required_irreps_in=[self.field + f"_{layer}_body" for layer in range(1, num_layers)] + [self.field + "_inf_body"],
+            required_irreps_in=[self.field + f"_{layer}_body" for layer in range(1, num_layers + 1)] + [self.field + "_inf_body"],
         )
 
-        for layer in range(1, num_layers):
+        for layer in range(1, num_layers + 1):
             self.scalar_mlps.append(
                 mlp_module(
                     mlp_latent_dimensions = mlp_latent_dimensions,
