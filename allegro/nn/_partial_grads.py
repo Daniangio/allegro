@@ -49,6 +49,7 @@ class CurlOutput(GraphModuleMixin, torch.nn.Module):
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         if self.production:
+            data[self.out_field] = torch.zeros((1,), dtype=torch.float32).to(data["pos"].device)
             return self.func(data)
         return self.forward_impl(data)
 

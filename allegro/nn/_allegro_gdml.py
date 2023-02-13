@@ -12,7 +12,7 @@ from nequip.data import AtomicDataDict
 from nequip.nn import GraphModuleMixin
 from nequip.utils.tp_utils import tp_path_exists
 
-from ._fc import ScalarMLPFunction
+from ._fc import ScalarMLPFunction, ExponentialScalarMLPFunction
 from .. import _keys
 from ._strided import Contracter, MakeWeightedChannels, Linear
 from .cutoffs import cosine_cutoff, polynomial_cutoff
@@ -46,7 +46,7 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
         r_start_cos_ratio: float = 0.8,
         PolynomialCutoff_p: float = 6,
         per_layer_cutoffs: Optional[List[float]] = None,
-        cutoff_type: str = "cosine",
+        cutoff_type: str = "polynomial",
         # general hyperparameters:
         field: str = AtomicDataDict.EDGE_ATTRS_KEY,
         edge_invariant_field: str = AtomicDataDict.EDGE_EMBEDDING_KEY,
@@ -56,9 +56,9 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
         linear_after_env_embed: bool = True,
         nonscalars_include_parity: bool = True,
         # MLP parameters:
-        two_body_latent=ScalarMLPFunction,
+        two_body_latent=ExponentialScalarMLPFunction,
         two_body_latent_kwargs={},
-        env_embed=ScalarMLPFunction,
+        env_embed=ExponentialScalarMLPFunction,
         env_embed_kwargs={},
         latent=ScalarMLPFunction,
         latent_kwargs={},
@@ -106,7 +106,7 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
             ],
         )
 
-        # for normalization of env embed sums
+        # for normalization of features
         # one per layer
         self.register_parameter(
             "env_sum_normalizations",
@@ -258,7 +258,6 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
             full_out_irreps = o3.Irreps(full_out_irreps)
             self._n_scalar_outs.append(n_scalar_outs)
             assert all(ir == SCALAR for _, ir in full_out_irreps[:n_scalar_outs])
-            
             tp = Contracter(
                 irreps_in1=o3.Irreps(
                     [
@@ -440,6 +439,11 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
             self.per_layer_cutoffs.min() > 0
         ), "Per-layer cutoffs must be >0. To remove higher layers entirely, lower `num_layers`."
         self.register_buffer("_zero", torch.as_tensor(0.0))
+
+        self.register_parameter(
+            "final_features_modulator",
+            torch.nn.Parameter(torch.as_tensor(1e2)),
+        )
 
         self.irreps_out.update(
             {
@@ -651,6 +655,6 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
         new_fetures = cutoff_coeffs[active_edges].unsqueeze(-1) * new_fetures
         
         final_features = torch.index_copy(final_features, 0, active_edges, new_fetures)
-        data[self.linear_out_field] = final_features
+        data[self.linear_out_field] = final_features * self.final_features_modulator
 
         return data

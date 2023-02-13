@@ -12,7 +12,7 @@ from nequip.data import AtomicDataDict
 from nequip.nn import GraphModuleMixin
 from nequip.utils.tp_utils import tp_path_exists
 
-from ._fc import ExponentialScalarMLPFunction
+from ._fc import ScalarMLPFunction, ExponentialScalarMLPFunction
 from .. import _keys
 from ._strided import Contracter, MakeWeightedChannels, Linear
 from .cutoffs import cosine_cutoff, polynomial_cutoff
@@ -63,7 +63,8 @@ class Allegro_Gibbs_Deep_Module(GraphModuleMixin, torch.nn.Module):
         two_body_latent_kwargs={},
         env_embed=ExponentialScalarMLPFunction,
         env_embed_kwargs={},
-        latent=ExponentialScalarMLPFunction,
+        latent=ScalarMLPFunction,
+        latent_attention=ScalarMLPFunction,
         latent_kwargs={},
         latent_resnet: bool = True,
         latent_resnet_update_ratios: Optional[List[float]] = None,
@@ -127,6 +128,10 @@ class Allegro_Gibbs_Deep_Module(GraphModuleMixin, torch.nn.Module):
         )
 
         latent = functools.partial(latent, **latent_kwargs)
+
+        import inspect
+        latent_attention_kwargs = {k: v for k, v in latent_kwargs.items() if k in inspect.getfullargspec(latent_attention)[0]}
+        latent_attention = functools.partial(latent_attention, **latent_attention_kwargs)
         env_embed = functools.partial(env_embed, **env_embed_kwargs)
 
         self.latents = torch.nn.ModuleList([])
@@ -309,7 +314,7 @@ class Allegro_Gibbs_Deep_Module(GraphModuleMixin, torch.nn.Module):
             if layer_idx >= self.num_pre_layers:
                 # Make attention query, key and value weights
                 self.attention_queries.append(
-                    latent(
+                    latent_attention(
                         mlp_input_dimension=(
                             (
                                 n_scalar_outs
@@ -319,7 +324,7 @@ class Allegro_Gibbs_Deep_Module(GraphModuleMixin, torch.nn.Module):
                     )
                 )
                 self.attention_keys.append(
-                    latent(
+                    latent_attention(
                         mlp_input_dimension=(
                             (
                                 n_scalar_outs
@@ -329,7 +334,7 @@ class Allegro_Gibbs_Deep_Module(GraphModuleMixin, torch.nn.Module):
                     )
                 )
                 self.attention_values.append(
-                    latent(
+                    latent_attention(
                         mlp_input_dimension=(
                             (
                                 n_scalar_outs
@@ -362,15 +367,18 @@ class Allegro_Gibbs_Deep_Module(GraphModuleMixin, torch.nn.Module):
                 generate_n_weights += self._env_weighter.weight_numel
 
             # the linear acts after the extractor
-            self.linears.append(
-                Linear(
-                    full_out_irreps,
-                    [(env_embed_multiplicity, ir) for _, ir in out_irreps],
-                    shared_weights=True,
-                    internal_weights=True,
-                    pad_to_alignment=pad_to_alignment,
+            if layer_idx < self.num_pre_layers + self.num_layers - 1:
+                self.linears.append(
+                    Linear(
+                        full_out_irreps,
+                        [(env_embed_multiplicity, ir) for _, ir in out_irreps],
+                        shared_weights=True,
+                        internal_weights=True,
+                        pad_to_alignment=pad_to_alignment,
+                    )
                 )
-            )
+            else:
+                self.linears.append(torch.nn.Identity())
 
             if layer_idx == 0:
                 # at the first layer, we have no invariants from previous TPs
@@ -469,7 +477,7 @@ class Allegro_Gibbs_Deep_Module(GraphModuleMixin, torch.nn.Module):
         self._latent_dim = self.final_latent.out_features
         self.register_buffer("_zero", torch.as_tensor(0.0))
 
-        out_fields = [self.latent_out_field + f"_{layer}_body" for layer in range(1, num_layers)] + [self.latent_out_field + "_inf_body"]
+        out_fields = [self.latent_out_field + f"_{layer}_body" for layer in range(1, num_layers + 1)] + [self.latent_out_field + "_inf_body"]
         self.irreps_out.update(
             {
                 self.latent_out_field: o3.Irreps(
@@ -651,8 +659,8 @@ class Allegro_Gibbs_Deep_Module(GraphModuleMixin, torch.nn.Module):
             # query, key, value have shape [z][mul][k_emb]
             if layer >= self.num_pre_layers:
                 attention_query = self.attention_queries[layer - self.num_pre_layers]
-                attention_key =self.attention_keys[layer - self.num_pre_layers]
-                attention_value =self.attention_values[layer - self.num_pre_layers]
+                attention_key = self.attention_keys[layer - self.num_pre_layers]
+                attention_value = self.attention_values[layer - self.num_pre_layers]
                 n_body_mlp = self.n_body_mlps[layer - self.num_pre_layers]
                 query_stacked = attention_query(attention_scalars)
                 key_stacked = attention_key(attention_scalars)
@@ -705,7 +713,8 @@ class Allegro_Gibbs_Deep_Module(GraphModuleMixin, torch.nn.Module):
             )
 
             # do the linear
-            features = linear(features)
+            if layer < self.num_pre_layers + self.num_layers - 1:
+                features = linear(features)
 
             # For layer2+, use the previous latents and scalars
             # This makes it deep
