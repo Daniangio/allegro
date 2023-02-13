@@ -147,6 +147,6 @@ class EdgewiseForcesSum(GraphModuleMixin, torch.nn.Module):
         atom_f = scatter(edge_f, edge_center, dim=0, dim_size=len(species))
 
         data[AtomicDataDict.FORCE_KEY] = atom_f
-        data[AtomicDataDict.PER_ATOM_ENERGY_KEY] = atom_f.sum(dim=-1, keepdim=True)
+        # data[AtomicDataDict.PER_ATOM_ENERGY_KEY] = atom_f.sum(dim=-1, keepdim=True)
 
         return data

@@ -86,14 +86,14 @@ def AllegroGDML(config, initialize: bool, dataset: Optional[ConcatDataset] = Non
         ),
         # Sum edgewise forces -> per-atom forces:
         "node_f": EdgewiseForcesSum,
-        "total_energy_sum": (
-            AtomwiseReduce,
-            dict(
-                reduce="sum",
-                field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
-                out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
-            ),
-        ),
+        # "total_energy_sum": (
+        #     AtomwiseReduce,
+        #     dict(
+        #         reduce="sum",
+        #         field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+        #         out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
+        #     ),
+        # ),
     }
 
     model = SequentialGraphNetwork.from_parameters(shared_params=config, layers=layers)
