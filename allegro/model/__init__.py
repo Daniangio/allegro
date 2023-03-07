@@ -6,6 +6,7 @@ from ._allegro_gdml import AllegroGDML
 from ._allegro_gdml_mace import AllegroGDML_MACE
 from ._allegro_mace import Allegro_MACE
 from ._curl import ForcesCurlOutput
+from ._scaling import PerSpeciesRescale
 
 __all__ = [
     Allegro,
@@ -15,5 +16,6 @@ __all__ = [
     AllegroGDML,
     AllegroGDML_MACE,
     Allegro_MACE,
-    ForcesCurlOutput
+    ForcesCurlOutput,
+    PerSpeciesRescale,
 ]

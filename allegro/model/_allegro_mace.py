@@ -56,7 +56,12 @@ def Allegro_MACE(config, initialize: bool, dataset: Optional[ConcatDataset] = No
     layers = {
         # -- Encode --
         # Get various edge invariants
-        "one_hot": OneHotAtomEncoding,
+        "one_hot": (
+            OneHotAtomEncoding,
+            dict(
+                node_input_features=config.get("node_input_features", [])
+            )
+        ),
         "radial_basis": (
             RadialBasisEdgeEncoding,
             dict(
@@ -79,19 +84,22 @@ def Allegro_MACE(config, initialize: bool, dataset: Optional[ConcatDataset] = No
                 node_invariant_field=AtomicDataDict.NODE_ATTRS_KEY,
             ),
         ),
-        # Sum edgewise energies -> per-atom forces:
-        "edge_e": (
+        # Sum edgewise energies -> per-atom energies:
+        "per_atom_energy": (
             EdgewiseEnergySum,
-            dict(field=EDGE_ENERGY, out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY),
-        ),
-        "total_energy_sum": (
-            AtomwiseReduce,
             dict(
-                reduce="sum",
-                field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
-                out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
+                field=EDGE_ENERGY,
+                out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY
             ),
         ),
+        # "total_energy_sum": (
+        #     AtomwiseReduce,
+        #     dict(
+        #         reduce="sum",
+        #         field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+        #         out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
+        #     ),
+        # ),
     }
 
     model = SequentialGraphNetwork.from_parameters(shared_params=config, layers=layers)

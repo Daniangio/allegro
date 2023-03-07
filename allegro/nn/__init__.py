@@ -8,6 +8,8 @@ from ._edgewise import EdgewiseEnergySum, EdgewiseReduce, EdgewiseForcesSum
 from ._fc import ScalarMLP, ScalarMLPFunction, ExponentialScalarMLP, ExponentialScalarMLPFunction, NBodyScalarMLP
 from ._norm_basis import NormalizedBasis
 from ._partial_grads import CurlOutput
+from ._mock import OutputMock
+from ._fixed_scaling import PerSpeciesFixedScaleShift
 
 
 __all__ = [
@@ -27,4 +29,6 @@ __all__ = [
     NBodyScalarMLP,
     NormalizedBasis,
     CurlOutput,
+    OutputMock,
+    PerSpeciesFixedScaleShift,
 ]

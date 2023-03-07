@@ -6,7 +6,7 @@ from e3nn import o3
 from torch.utils.data import ConcatDataset
 
 from nequip.data import AtomicDataDict
-from nequip.nn import SequentialGraphNetwork, AtomwiseReduce
+from nequip.nn import SequentialGraphNetwork
 from nequip.nn.radial_basis import BesselBasis
 
 from nequip.nn.embedding import (
@@ -14,12 +14,13 @@ from nequip.nn.embedding import (
     SphericalHarmonicEdgeAttrs,
     RadialBasisEdgeEncoding,
 )
-from nequip.nn._atomwise import AtomwiseLinear
+from nequip.nn._atomwise import AtomwiseLinear, AtomwiseReduce
 
 from allegro.nn import (
     NormalizedBasis,
     EdgewiseForcesSum,
     AllegroGDML_Module,
+    OutputMock,
 )
 from allegro._keys import EDGE_FEATURES, EDGE_FORCES
 
@@ -86,14 +87,21 @@ def AllegroGDML(config, initialize: bool, dataset: Optional[ConcatDataset] = Non
         ),
         # Sum edgewise forces -> per-atom forces:
         "node_f": EdgewiseForcesSum,
-        # "total_energy_sum": (
-        #     AtomwiseReduce,
-        #     dict(
-        #         reduce="sum",
-        #         field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
-        #         out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
-        #     ),
-        # ),
+        "per_atom_energy": (
+            OutputMock,
+            dict(
+                out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+                out_field_irreps=o3.Irreps("1x0e")
+            ),
+        ),
+        "total_energy_sum": (
+            AtomwiseReduce,
+            dict(
+                reduce="sum",
+                field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+                out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
+            ),
+        ),
     }
 
     model = SequentialGraphNetwork.from_parameters(shared_params=config, layers=layers)

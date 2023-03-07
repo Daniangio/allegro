@@ -37,11 +37,12 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
     # saved params
     num_layers: int
     field: str
-    linear_out_field: str
+    out_field: str
     num_types: int
     env_embed_mul: int
     weight_numel: int
     latent_resnet: bool
+    embed_initial_edge: bool
 
     # internal values
     _env_builder_w_index: List[int]
@@ -65,6 +66,7 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
         edge_invariant_field: str = AtomicDataDict.EDGE_EMBEDDING_KEY,
         node_invariant_field: str = AtomicDataDict.NODE_ATTRS_KEY,
         env_embed_multiplicity: int = 32,
+        embed_initial_edge: bool = True,
         linear_after_env_embed: bool = True,
         nonscalars_include_parity: bool = True,
         # MLP parameters:
@@ -80,6 +82,7 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
         linear_out_field: Optional[str] = _keys.EDGE_FEATURES,
         # Performance parameters:
         pad_to_alignment: int = 1,
+        sparse_mode: Optional[str] = None,
         # Other:
         irreps_in=None,
     ):
@@ -102,6 +105,7 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
         self.polynomial_cutoff_p = float(PolynomialCutoff_p)
         self.cutoff_type = cutoff_type
         assert cutoff_type in ("cosine", "polynomial")
+        self.embed_initial_edge = embed_initial_edge
         self.avg_num_neighbors = avg_num_neighbors
         self.linear_after_env_embed = linear_after_env_embed
         self.num_types = num_types
@@ -126,39 +130,28 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
         self.register_buffer(
             "env_sum_normalizations",
             # dividing by sqrt(N)
-            torch.as_tensor([avg_num_neighbors] * num_layers).reciprocal(),
+            torch.as_tensor([avg_num_neighbors] * num_layers).rsqrt(),
         )
 
         latent = functools.partial(latent, **latent_kwargs)
         env_embed = functools.partial(env_embed, **env_embed_kwargs)
 
         self.latents = torch.nn.ModuleList([])
+        self.latents_to_weights = torch.nn.ModuleList([])
         self.env_embed_mlps = torch.nn.ModuleList([])
-
         self.reshape_modules = torch.nn.ModuleList([])
         self.interactions = torch.nn.ModuleList([])
         self.products = torch.nn.ModuleList([])
         self.reshape_back_modules = torch.nn.ModuleList([])
-        
-        self.latents_to_features_weights = torch.nn.ModuleList([])
-        self.latents_to_features_old_weights = torch.nn.ModuleList([])
-        self.feature_linears = torch.nn.ModuleList([])
-        self.feature_old_linears = torch.nn.ModuleList([])
+        self.tps = torch.nn.ModuleList([])
+        self.linears = torch.nn.ModuleList([])
         self.env_linears = torch.nn.ModuleList([])
 
         # Embed to the spharm * it as mul
         input_irreps = self.irreps_in[self.field]
         # this is not inherant, but no reason to fix right now:
         assert all(mul == 1 for mul, ir in input_irreps)
-
-        # Environment builder:
-        self._initial_env_weighter = MakeWeightedChannels(
-            irreps_in=input_irreps,
-            multiplicity_out=env_embed_multiplicity,
-            pad_to_alignment=pad_to_alignment,
-        )
-
-        env_embed_irreps = o3.Irreps([(env_embed_multiplicity, ir) for _, ir in input_irreps])
+        env_embed_irreps = o3.Irreps([(1, ir) for _, ir in input_irreps])
         assert (
             env_embed_irreps[0].ir == SCALAR
         ), "env_embed_irreps must start with scalars"
@@ -167,24 +160,98 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
         ) - env_embed_irreps.dim
         self.register_buffer("_zero", torch.zeros(1, 1))
 
+        # Initially, we have the B(r)Y(\vec{r})-projection of the edges
+        # (possibly embedded)
+        if self.embed_initial_edge:
+            arg_irreps = env_embed_irreps
+        else:
+            arg_irreps = input_irreps
+
+        # - begin irreps -
+        # start to build up the irreps for the iterated TPs
+        tps_irreps = [arg_irreps]
+
+        for layer_idx in range(num_layers):
+            # Create higher order terms cause there are more TPs coming
+            if layer_idx == 0:
+                # Add parity irreps
+                ir_out = []
+                for (mul, ir) in env_embed_irreps:
+                    if self.nonscalars_include_parity:
+                        # add both parity options
+                        ir_out.append((1, (ir.l, 1)))
+                        ir_out.append((1, (ir.l, -1)))
+                    else:
+                        # add only the parity option seen in the inputs
+                        ir_out.append((1, ir))
+
+                ir_out = o3.Irreps(ir_out)
+
+            if layer_idx == self.num_layers - 1:
+                # ^ means we're doing the last layer
+                # No more TPs follow this, so only need L=1 vectors
+                ir_out = o3.Irreps(
+                [
+                    (mul, ir)
+                    for mul, ir in ir_out
+                    if tp_path_exists(arg_irreps, env_embed_irreps, ir) and 
+                    ((ir.l == 0 and ir.p == 1) or (ir.l == 1 and ir.p == -1))
+                ]
+            )
+
+            # Prune impossible paths
+            ir_out = o3.Irreps(
+                [
+                    (mul, ir)
+                    for mul, ir in ir_out
+                    if tp_path_exists(arg_irreps, env_embed_irreps, ir)
+                ]
+            )
+
+            # the argument to the next tensor product is the output of this one
+            arg_irreps = ir_out
+            tps_irreps.append(ir_out)
+        # - end build irreps -
+
+        # == Remove unneeded paths ==
+        out_irreps = tps_irreps[-1]
+        new_tps_irreps = [out_irreps]
+        for arg_irreps in reversed(tps_irreps[:-1]):
+            new_arg_irreps = []
+            for mul, arg_ir in arg_irreps:
+                for _, env_ir in env_embed_irreps:
+                    if any(i in out_irreps for i in arg_ir * env_ir):
+                        # arg_ir is useful: arg_ir * env_ir has a path to something we want
+                        new_arg_irreps.append((mul, arg_ir))
+                        # once its useful once, we keep it no matter what
+                        break
+            new_arg_irreps = o3.Irreps(new_arg_irreps)
+            new_tps_irreps.append(new_arg_irreps)
+            out_irreps = new_arg_irreps
+
+        assert len(new_tps_irreps) == len(tps_irreps)
+        tps_irreps = list(reversed(new_tps_irreps))
+        del new_tps_irreps
+
+        assert tps_irreps[-1].lmax == 1
+
+        tps_irreps_in = tps_irreps[:-1]
+        tps_irreps_out = tps_irreps[1:]
+        del tps_irreps
+
+        # Environment builder:
         self._env_weighter = MakeWeightedChannels(
             irreps_in=input_irreps,
             multiplicity_out=env_embed_multiplicity,
             pad_to_alignment=pad_to_alignment,
         )
 
-        # - begin irreps -
-        for layer_idx in range(self.num_layers):
-            # Make env embed mlp
-            generate_n_weights = (
-                self._env_weighter.weight_numel
-            )  # the weight for the edge embedding
-            if layer_idx == 0:
-                # also need weights to embed the edge itself
-                # this is because the 2 body latent is mixed in with the first layer
-                # in terms of code
-                generate_n_weights += self._initial_env_weighter.weight_numel
-            
+        self._n_scalar_outs = []
+
+        # == Build TPs ==
+        for layer_idx, (arg_irreps, out_irreps) in enumerate(
+            zip(tps_irreps_in, tps_irreps_out)
+        ):
             # Make the env embed linear
             if self.linear_after_env_embed:
                 self.env_linears.append(
@@ -201,21 +268,22 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
             # Make interaction
             interaction_irreps: o3.Irreps = (self.irreps_in[self.field] * env_embed_multiplicity).sort()[0].simplify()
 
-            mace_hidden_irreps = o3.Irreps(
+            local_env_per_edge_irreps = o3.Irreps(
                 [(env_embed_multiplicity, ir) for _, ir in env_embed_irreps]
             )
+            self.hidden_irreps = local_env_per_edge_irreps
             
             # Reshape back product so that you can perform tp
-            self.reshape_modules.append(inverse_reshape_irreps(env_embed_irreps))
+            self.reshape_modules.append(inverse_reshape_irreps(local_env_per_edge_irreps))
 
             self.interactions.append(
                 RealAgnosticInteractionBlock(
                     node_attrs_irreps=self.irreps_in[self.node_invariant_field],
-                    node_feats_irreps=env_embed_irreps,
+                    node_feats_irreps=local_env_per_edge_irreps,
                     edge_attrs_irreps=self.irreps_in[self.field],
                     edge_feats_irreps=self.irreps_in[self.edge_invariant_field],
                     target_irreps=interaction_irreps,
-                    hidden_irreps=mace_hidden_irreps,
+                    hidden_irreps=self.hidden_irreps,
                     avg_num_neighbors=avg_num_neighbors,
                 )
             )
@@ -226,7 +294,7 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
             self.products.append(
                 EquivariantProductBasisBlock(
                     node_feats_irreps=self.interactions[-1].target_irreps,
-                    target_irreps=env_embed_irreps,
+                    target_irreps=self.hidden_irreps,
                     correlation=correlation,
                     num_elements=self.irreps_in[self.node_invariant_field].dim,
                     use_sc=False,
@@ -234,32 +302,86 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
             )
 
             # Reshape back product so that you can perform tp
-            self.reshape_back_modules.append(reshape_irreps(env_embed_irreps))
+            self.reshape_back_modules.append(reshape_irreps(local_env_per_edge_irreps))
+
+            # Make TP
+            tmp_i_out: int = 0
+            instr = []
+            n_scalar_outs: int = 0
+            full_out_irreps = []
+            for i_out, (_, ir_out) in enumerate(out_irreps):
+                for i_1, (_, ir_1) in enumerate(arg_irreps):
+                    for i_2, (_, ir_2) in enumerate(env_embed_irreps):
+                        if ir_out in ir_1 * ir_2:
+                            if ir_out == SCALAR:
+                                n_scalar_outs += 1
+                            instr.append((i_1, i_2, tmp_i_out))
+                            full_out_irreps.append((env_embed_multiplicity, ir_out))
+                            tmp_i_out += 1
+            full_out_irreps = o3.Irreps(full_out_irreps)
+            self._n_scalar_outs.append(n_scalar_outs)
+            assert all(ir == SCALAR for _, ir in full_out_irreps[:n_scalar_outs])
+            tp = Contracter(
+                irreps_in1=o3.Irreps(
+                    [
+                        (
+                            (
+                                env_embed_multiplicity
+                                if layer_idx > 0 or self.embed_initial_edge
+                                else 1
+                            ),
+                            ir,
+                        )
+                        for _, ir in arg_irreps
+                    ]
+                ),
+                irreps_in2 = local_env_per_edge_irreps,
+                irreps_out = o3.Irreps(
+                    [(env_embed_multiplicity, ir) for _, ir in full_out_irreps]
+                ),
+                instructions=instr,
+                # For the first layer, we have the unprocessed edges
+                # coming in from the input if `not self.embed_initial_edge`.
+                # These don't match the embedding in mul, so we have
+                # to use uvv --- since the input edges should be mul
+                # of one in normal circumstances, this is still plenty fast.
+                # For this reason it also doesn't increase the number of weights.
+                connection_mode=(
+                    "uuu" if layer_idx > 0 or self.embed_initial_edge else "uvv"
+                ),
+                shared_weights=False,
+                has_weight=False,
+                pad_to_alignment=pad_to_alignment,
+                sparse_mode=sparse_mode,
+            )
+            self.tps.append(tp)
+            # we extract the scalars from the first irrep of the tp
+            # assert out_irreps[0].ir == SCALAR !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+            # Make env embed mlp
+            generate_n_weights = (
+                self._env_weighter.weight_numel
+            )  # the weight for the edge embedding
+            if layer_idx == 0 and self.embed_initial_edge:
+                # also need weights to embed the edge itself
+                # this is because the 2 body latent is mixed in with the first layer
+                # in terms of code
+                generate_n_weights += self._env_weighter.weight_numel
 
             # the linear acts after the extractor
-            self.feature_linears.append(
+            out_irreps = [(env_embed_multiplicity, ir) for _, ir in out_irreps]
+            self.linears.append(
                 Linear(
-                    env_embed_irreps,
-                    env_embed_irreps,
+                    full_out_irreps,
+                    out_irreps,
                     shared_weights=False,
                     internal_weights=False,
                     pad_to_alignment=pad_to_alignment,
                 )
             )
-            self.feature_old_linears.append(
-                Linear(
-                    env_embed_irreps,
-                    env_embed_irreps,
-                    shared_weights=False,
-                    internal_weights=False,
-                    pad_to_alignment=pad_to_alignment,
-                )
-            )
-
-            self._n_degree_l_outs = [2*ir.l + 1 for _, ir in env_embed_irreps]
 
             if layer_idx == 0:
-                # at the first layer, we have no invariants from previous products
+                # at the first layer, we have no invariants from previous TPs
                 self.latents.append(
                     two_body_latent(
                         mlp_input_dimension=(
@@ -282,37 +404,24 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
                             (
                                 # the embedded latent invariants from the previous layer(s)
                                 self.latents[-1].out_features
-                                # and the invariants extracted from the last layer's product:
-                                + env_embed_multiplicity * len(self._n_degree_l_outs)
+                                # and the invariants extracted from the last layer's TP:
+                                + env_embed_multiplicity * n_scalar_outs
                             )
                         ),
                         mlp_output_dimension=None,
                     )
                 )
-            self.latents_to_features_weights.append(
+            self.latents_to_weights.append(
                 latent(
                     mlp_input_dimension=(
                         (
                             # the embedded latent invariants from the previous layer(s)
                             self.latents[-1].out_features
-                            # and the invariants extracted from the last layer's product:
-                            + env_embed_multiplicity * len(self._n_degree_l_outs)
+                            # and the invariants extracted from the last layer's TP:
+                            + env_embed_multiplicity * n_scalar_outs
                         )
                     ),
-                    mlp_output_dimension=self.feature_linears[-1].weight_numel,
-                )
-            )
-            self.latents_to_features_old_weights.append(
-                latent(
-                    mlp_input_dimension=(
-                        (
-                            # the embedded latent invariants from the previous layer(s)
-                            self.latents[-1].out_features
-                            # and the invariants extracted from the last layer's product:
-                            + env_embed_multiplicity * len(self._n_degree_l_outs)
-                        )
-                    ),
-                    mlp_output_dimension=self.feature_old_linears[-1].weight_numel,
+                    mlp_output_dimension=self.linears[-1].weight_numel,
                 )
             )
             
@@ -331,7 +440,7 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
         final_out_irreps = o3.Irreps([(1, (1, -1))])
         self._features_final_dim = final_out_irreps.dim
         self.final_linear = Linear(
-                    env_embed_irreps,
+                    out_irreps,
                     final_out_irreps,
                     shared_weights=False,
                     internal_weights=False,
@@ -340,7 +449,7 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
         
         self.final_latent_to_weights = latent(
             mlp_input_dimension=self.latents[-1].out_features
-            + env_embed_multiplicity * len(self._n_degree_l_outs),
+            + env_embed_multiplicity * n_scalar_outs,
             mlp_output_dimension=self.final_linear.weight_numel,
         )
         # - end build modules -
@@ -394,7 +503,7 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
 
         self.register_parameter(
             "final_features_modulator",
-            torch.nn.Parameter(torch.as_tensor(1.)),
+            torch.nn.Parameter(torch.as_tensor(1e2)),
         )
 
         self.irreps_out.update(
@@ -457,8 +566,7 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
             edge_invariants,
         ]
         # The nonscalar features. Initially, the edge data.
-        features_old: torch.Tensor = edge_attr
-        features: torch.Tensor = features_old
+        features = edge_attr
 
         layer_index: int = 0
         # compute the sigmoids vectorized instead of each loop
@@ -484,12 +592,9 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
 
         # !!!! REMEMBER !!!! update final layer if update the code in main loop!!!
         # This goes through layer0, layer1, ..., layer_max-1
-        for latent, env_embed_mlp, env_linear, latent_to_features_weights, latent_to_features_old_weights, \
-            feature_linear, feature_old_linear, reshape, inter, prod, reshape_back in zip(
-            self.latents, self.env_embed_mlps, self.env_linears,
-            self.latents_to_features_weights, self.latents_to_features_old_weights,
-            self.feature_linears, self.feature_old_linears, self.reshape_modules, self.interactions,
-            self.products, self.reshape_back_modules,
+        for latent, latent_to_weights, env_embed_mlp, env_linear, tp, linear, reshape, inter, prod, reshape_back in zip(
+            self.latents, self.latents_to_weights, self.env_embed_mlps, self.env_linears, self.tps,
+            self.linears, self.reshape_modules, self.interactions, self.products, self.reshape_back_modules,
         ):
             # Determine which edges are still in play
             cutoff_coeffs = cutoff_coeffs_all[layer_index]
@@ -534,16 +639,16 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
             weights = env_embed_mlp(latents[active_edges])
             w_index: int = 0
 
-            if layer_index == 0:
+            if self.embed_initial_edge and layer_index == 0:
                 # embed initial edge
-                env_w = weights.narrow(-1, w_index, self._initial_env_weighter.weight_numel)
-                w_index += self._initial_env_weighter.weight_numel
-                features_old = self._initial_env_weighter(
-                    features_old[prev_mask], env_w
+                env_w = weights.narrow(-1, w_index, self._env_weighter.weight_numel)
+                w_index += self._env_weighter.weight_numel
+                features = self._env_weighter(
+                    features[prev_mask], env_w
                 )  # features is edge_attr
             else:
                 # just take the previous features that we still need
-                features_old = features[prev_mask]
+                features = features[prev_mask]
 
             # Extract weights for the environment builder
             env_w = weights.narrow(-1, w_index, self._env_weighter.weight_numel)
@@ -555,10 +660,8 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
             # Those are the active edges, which are the only ones we
             # have weights for (env_w) anyway.
             # So we mask out the edges in the sum:
-            emb_latent = self._env_weighter(edge_attr[active_edges], env_w)
-
-            local_env_per_atom = scatter(
-                emb_latent + features_old[active_edges],
+            local_env_per_edge = scatter(
+                self._env_weighter(edge_attr[active_edges], env_w),
                 edge_center[active_edges],
                 dim=0,
             )
@@ -571,45 +674,37 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
                 norm_const = self.env_sum_normalizations[
                     layer_index, data[AtomicDataDict.ATOM_TYPE_KEY]
                 ].unsqueeze(-1)
-            local_env_per_atom = local_env_per_atom * norm_const
-            local_env_per_atom = env_linear(local_env_per_atom)
+            local_env_per_edge = local_env_per_edge * norm_const
+            local_env_per_edge = env_linear(local_env_per_edge)
 
-            local_env_per_atom = reshape(local_env_per_atom)
+            local_env_per_edge = reshape(local_env_per_edge)
 
-            local_env_per_atom, sc = inter(
+            local_env_per_edge, sc = inter(
                 node_attrs=node_invariants, # (n_nodes, n_elements)
-                node_feats=local_env_per_atom,
+                node_feats=local_env_per_edge,
                 edge_attrs=edge_attr, # (n_edges, 1+3+5...)
                 edge_feats=edge_invariants, # (n_edges, num_radial_basis)
                 edge_index=data[AtomicDataDict.EDGE_INDEX_KEY],
             )
-            local_env_per_atom = local_env_per_atom
 
-            features: torch.Tensor = prod(
-                node_feats=local_env_per_atom, sc=sc, node_attrs=node_invariants
+            local_env_per_edge = prod(
+                node_feats=local_env_per_edge, sc=sc, node_attrs=node_invariants
             )
 
-            features = reshape_back(features)
+            local_env_per_edge = reshape_back(local_env_per_edge)
 
             # Copy to get per-edge
             # Large allocation, but no better way to do this:
-            features = features[edge_center[active_edges]]
+            local_env_per_edge = local_env_per_edge[edge_center[active_edges]]
+
+            # Now do the TP
+            # recursively tp current features with the environment embeddings
+            features = tp(features, local_env_per_edge)
 
             # Get invariants
             # features has shape [z][mul][k]
-            scalars_to_cat = []
-            last_n_degree_l_outs = 0
-            for n_degree_l_outs in self._n_degree_l_outs:
-                if n_degree_l_outs == 1:
-                    scalar = features[:, :, 0]
-                else:
-                    scalar = features[:, :, last_n_degree_l_outs:n_degree_l_outs].norm(p=2, dim=-1)
-                scalars_to_cat.append(
-                    scalar
-                )
-                last_n_degree_l_outs = n_degree_l_outs
-            
-            scalars = torch.cat(scalars_to_cat, dim=-1).reshape(
+            # we know scalars are first
+            scalars = features[:, :, : self._n_scalar_outs[layer_index]].reshape(
                 features.shape[0], -1
             )
 
@@ -619,13 +714,8 @@ class AllegroGDML_MACE_Module(GraphModuleMixin, torch.nn.Module):
                 scalars,
             ]
 
-            linear_features_weights = latent_to_features_weights(torch.cat(latent_inputs_to_cat, dim=-1))
-            features = feature_linear(features, w=linear_features_weights)
-
-            linear_features_old_weights = latent_to_features_old_weights(torch.cat(latent_inputs_to_cat, dim=-1))
-            features_old = feature_old_linear(features_old, w=linear_features_old_weights)
-
-            features = features + features_old
+            linear_weights = latent_to_weights(torch.cat(latent_inputs_to_cat, dim=-1))
+            features = linear(features, w=linear_weights)
 
             # increment counter
             layer_index += 1
