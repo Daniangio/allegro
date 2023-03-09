@@ -25,7 +25,7 @@ from allegro._keys import EDGE_ENERGY
 from nequip.model import builder_utils
 
 
-def Allegro_MACE(config, initialize: bool, dataset: Optional[ConcatDataset] = None):
+def Allegro_MACE_NMR(config, initialize: bool, dataset: Optional[ConcatDataset] = None):
     logging.debug("Building Allegro model...")
 
     # Handle avg num neighbors auto
@@ -90,14 +90,6 @@ def Allegro_MACE(config, initialize: bool, dataset: Optional[ConcatDataset] = No
             dict(
                 field=EDGE_ENERGY,
                 out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY
-            ),
-        ),
-        "total_energy_sum": (
-            AtomwiseReduce,
-            dict(
-                reduce="sum",
-                field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
-                out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
             ),
         ),
     }

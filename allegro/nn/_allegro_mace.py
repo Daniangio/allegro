@@ -137,8 +137,6 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
         self.latents = torch.nn.ModuleList([])
         self.env_embed_mlps = torch.nn.ModuleList([])
 
-        self.reshape_modules = torch.nn.ModuleList([])
-        self.interactions = torch.nn.ModuleList([])
         self.products = torch.nn.ModuleList([])
         self.reshape_back_modules = torch.nn.ModuleList([])
         
@@ -200,29 +198,10 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
             # Make interaction
             interaction_irreps: o3.Irreps = (self.irreps_in[self.field] * env_embed_multiplicity).sort()[0].simplify()
 
-            mace_hidden_irreps = o3.Irreps(
-                [(env_embed_multiplicity, ir) for _, ir in env_embed_irreps]
-            )
-            
-            # Reshape back product so that you can perform tp
-            self.reshape_modules.append(inverse_reshape_irreps(env_embed_irreps))
-
-            self.interactions.append(
-                RealAgnosticInteractionBlock(
-                    node_attrs_irreps=self.irreps_in[self.node_invariant_field],
-                    node_feats_irreps=env_embed_irreps,
-                    edge_attrs_irreps=self.irreps_in[self.field],
-                    edge_feats_irreps=self.irreps_in[self.edge_invariant_field],
-                    target_irreps=interaction_irreps,
-                    hidden_irreps=mace_hidden_irreps,
-                    avg_num_neighbors=avg_num_neighbors,
-                )
-            )
-
             # Make product
             self.products.append(
                 EquivariantProductBasisBlock(
-                    node_feats_irreps=self.interactions[-1].target_irreps,
+                    node_feats_irreps=interaction_irreps,
                     target_irreps=env_embed_irreps,
                     correlation=product_correlation,
                     num_elements=self.irreps_in[self.node_invariant_field].dim,
@@ -470,10 +449,9 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
         # !!!! REMEMBER !!!! update final layer if update the code in main loop!!!
         # This goes through layer0, layer1, ..., layer_max-1
         for latent, env_embed_mlp, env_linear, \
-            feature_linear, reshape, inter, prod, reshape_back in zip(
+            feature_linear, prod, reshape_back in zip(
             self.latents, self.env_embed_mlps, self.env_linears,
-            self.feature_linears, self.reshape_modules, self.interactions,
-            self.products, self.reshape_back_modules,
+            self.feature_linears, self.products, self.reshape_back_modules,
         ):
             # Determine which edges are still in play
             cutoff_coeffs = cutoff_coeffs_all[layer_index]
@@ -561,19 +539,8 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
             local_env_per_atom = local_env_per_atom * norm_const
             local_env_per_atom = env_linear(local_env_per_atom)
 
-            local_env_per_atom = reshape(local_env_per_atom)
-
-            local_env_per_atom, sc = inter(
-                node_attrs=node_invariants, # (n_nodes, n_elements)
-                node_feats=local_env_per_atom,
-                edge_attrs=edge_attr, # (n_edges, 1+3+5...)
-                edge_feats=edge_invariants, # (n_edges, num_radial_basis)
-                edge_index=data[AtomicDataDict.EDGE_INDEX_KEY].flip(0),
-            )
-            local_env_per_atom:torch.Tensor = local_env_per_atom
-
             new_features: torch.Tensor = prod(
-                node_feats=local_env_per_atom, sc=sc, node_attrs=node_invariants
+                node_feats=local_env_per_atom, sc=None, node_attrs=node_invariants
             )
 
             new_features: torch.Tensor = reshape_back(new_features)

@@ -5,6 +5,7 @@ from ._allegro_gibbs_deep import AllegroGibbsDeep
 from ._allegro_gdml import AllegroGDML
 from ._allegro_gdml_mace import AllegroGDML_MACE
 from ._allegro_mace import Allegro_MACE
+from ._allegro_mace_nmr import Allegro_MACE_NMR
 from ._curl import ForcesCurlOutput
 from ._scaling import PerSpeciesRescale
 
@@ -16,6 +17,7 @@ __all__ = [
     AllegroGDML,
     AllegroGDML_MACE,
     Allegro_MACE,
+    Allegro_MACE_NMR,
     ForcesCurlOutput,
     PerSpeciesRescale,
 ]
