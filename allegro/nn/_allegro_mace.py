@@ -1,6 +1,9 @@
-from typing import Callable, Optional, List
+from typing import Optional, List
 import math
 import functools
+
+# import os
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 import torch
 from torch_runstats.scatter import scatter

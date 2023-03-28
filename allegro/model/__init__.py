@@ -7,7 +7,7 @@ from ._allegro_gdml_mace import AllegroGDML_MACE
 from ._allegro_mace import Allegro_MACE
 from ._allegro_mace_nmr import Allegro_MACE_NMR
 from ._curl import ForcesCurlOutput
-from ._scaling import PerSpeciesRescale
+from ._scaling import PerSpeciesRescale, PerSpeciesGlobalRescale
 
 __all__ = [
     Allegro,
@@ -20,4 +20,5 @@ __all__ = [
     Allegro_MACE_NMR,
     ForcesCurlOutput,
     PerSpeciesRescale,
+    PerSpeciesGlobalRescale,
 ]

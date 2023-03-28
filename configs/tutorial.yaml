@@ -1,10 +1,11 @@
 # general
 root: results/tutorial
 run_name: silicon
-seed: 123456
-dataset_seed: 123456
+seed: 100
+dataset_seed: 100
 append: true
 default_dtype: float32
+device: cuda:0
 
 # -- network --
 model_builders:
@@ -113,7 +114,7 @@ metrics_components:
 
 # lr scheduler, drop lr if no improvement for 50 epochs
 lr_scheduler_name: ReduceLROnPlateau
-lr_scheduler_patience: 50
+lr_scheduler_patience: 15
 lr_scheduler_factor: 0.5
 
 early_stopping_lower_bounds:
