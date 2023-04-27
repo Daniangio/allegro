@@ -585,8 +585,8 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
 
         # final linear
         cutoff_coeffs = cutoff_coeffs_all[layer_index]
-        prev_mask = cutoff_coeffs[active_edges] > 0
-        active_edges = (cutoff_coeffs > 0).nonzero().squeeze(-1)
+        prev_mask = cutoff_coeffs[active_edges] > -1e-3
+        active_edges = (cutoff_coeffs > -1e-3).nonzero().squeeze(-1)
 
         linear_weights = self.final_latent_to_weights(latents)
         final_features = self.final_linear(features, w=linear_weights).reshape(features.shape[0], -1) * self.final_features_modulator
