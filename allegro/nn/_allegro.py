@@ -343,6 +343,7 @@ class Allegro_Module(GraphModuleMixin, torch.nn.Module):
                         mlp_output_dimension=None,
                     )
                 )
+
             # the env embed MLP takes the last latent's output as input
             # and outputs enough weights for the env embedder
             self.env_embed_mlps.append(
@@ -424,6 +425,7 @@ class Allegro_Module(GraphModuleMixin, torch.nn.Module):
         :param data: AtomicDataDict.Type
         :return: AtomicDataDict.Type
         """
+
         edge_center = data[AtomicDataDict.EDGE_INDEX_KEY][0]
         edge_neighbor = data[AtomicDataDict.EDGE_INDEX_KEY][1]
 
@@ -491,13 +493,15 @@ class Allegro_Module(GraphModuleMixin, torch.nn.Module):
 
         # !!!! REMEMBER !!!! update final layer if update the code in main loop!!!
         # This goes through layer0, layer1, ..., layer_max-1
-        for latent, env_embed_mlp, env_linear, tp, linear in zip(
-            self.latents, self.env_embed_mlps, self.env_linears, self.tps, self.linears
+        for latent, env_embed_mlp, env_linear, linear, \
+            tp in zip(
+            self.latents, self.env_embed_mlps, self.env_linears, self.linears, \
+            self.tps
         ):
             # Determine which edges are still in play
             cutoff_coeffs = cutoff_coeffs_all[layer_index]
-            prev_mask = cutoff_coeffs[active_edges] > 0
-            active_edges = (cutoff_coeffs > 0).nonzero().squeeze(-1)
+            prev_mask = cutoff_coeffs[active_edges] > -1e-3
+            active_edges = (cutoff_coeffs > -1e-3).nonzero().squeeze(-1)
 
             # Compute latents
             new_latents = latent(torch.cat(latent_inputs_to_cat, dim=-1)[prev_mask])
@@ -558,8 +562,9 @@ class Allegro_Module(GraphModuleMixin, torch.nn.Module):
             # Those are the active edges, which are the only ones we
             # have weights for (env_w) anyway.
             # So we mask out the edges in the sum:
-            local_env_per_edge = scatter(
-                self._env_weighter(edge_attr[active_edges], env_w),
+            emb_latent = self._env_weighter(edge_attr[active_edges], env_w)
+            local_env_per_atom = scatter(
+                emb_latent,
                 edge_center[active_edges],
                 dim=0,
             )
@@ -572,11 +577,10 @@ class Allegro_Module(GraphModuleMixin, torch.nn.Module):
                 norm_const = self.env_sum_normalizations[
                     layer_index, data[AtomicDataDict.ATOM_TYPE_KEY]
                 ].unsqueeze(-1)
-            local_env_per_edge = local_env_per_edge * norm_const
-            local_env_per_edge = env_linear(local_env_per_edge)
+            local_env_per_atom = env_linear(local_env_per_atom * norm_const)
             # Copy to get per-edge
             # Large allocation, but no better way to do this:
-            local_env_per_edge = local_env_per_edge[edge_center[active_edges]]
+            local_env_per_edge = local_env_per_atom[edge_center[active_edges]]
 
             # Now do the TP
             # recursively tp current features with the environment embeddings
@@ -607,8 +611,8 @@ class Allegro_Module(GraphModuleMixin, torch.nn.Module):
         # copy and repeat the code here --- no way to
         # escape the final iteration of the loop early
         cutoff_coeffs = cutoff_coeffs_all[layer_index]
-        prev_mask = cutoff_coeffs[active_edges] > 0
-        active_edges = (cutoff_coeffs > 0).nonzero().squeeze(-1)
+        prev_mask = cutoff_coeffs[active_edges] > -1e-3
+        active_edges = (cutoff_coeffs > -1e-3).nonzero().squeeze(-1)
         new_latents = self.final_latent(
             torch.cat(latent_inputs_to_cat, dim=-1)[prev_mask]
         )

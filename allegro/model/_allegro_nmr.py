@@ -3,11 +3,11 @@ import logging
 
 from e3nn import o3
 
-from torch.utils.data import ConcatDataset
-
 from nequip.data import AtomicDataDict
-from nequip.nn import SequentialGraphNetwork
+from nequip.nn import SequentialGraphNetwork, AtomwiseReduce
 from nequip.nn.radial_basis import BesselBasis
+
+from torch.utils.data import ConcatDataset
 
 from nequip.nn.embedding import (
     OneHotAtomEncoding,
@@ -18,14 +18,15 @@ from nequip.nn.embedding import (
 from allegro.nn import (
     NormalizedBasis,
     EdgewiseEnergySum,
-    Allegro_MACE_Module,
+    Allegro_Module,
+    ScalarMLP,
 )
-from allegro._keys import EDGE_ENERGY
+from allegro._keys import EDGE_FEATURES, EDGE_ENERGY
 
 from nequip.model import builder_utils
 
 
-def Allegro_MACE_NMR(config, initialize: bool, dataset: Optional[ConcatDataset] = None):
+def Allegro_NMR(config, initialize: bool, dataset: Optional[ConcatDataset] = None):
     logging.debug("Building Allegro model...")
 
     # Handle avg num neighbors auto
@@ -56,12 +57,7 @@ def Allegro_MACE_NMR(config, initialize: bool, dataset: Optional[ConcatDataset] 
     layers = {
         # -- Encode --
         # Get various edge invariants
-        "one_hot": (
-            OneHotAtomEncoding,
-            dict(
-                node_input_features=config.get("node_input_features", [])
-            )
-        ),
+        "one_hot": OneHotAtomEncoding,
         "radial_basis": (
             RadialBasisEdgeEncoding,
             dict(
@@ -77,12 +73,16 @@ def Allegro_MACE_NMR(config, initialize: bool, dataset: Optional[ConcatDataset] 
         "spharm": SphericalHarmonicEdgeAttrs,
         # The core allegro model:
         "allegro": (
-            Allegro_MACE_Module,
+            Allegro_Module,
             dict(
                 field=AtomicDataDict.EDGE_ATTRS_KEY,  # initial input is the edge SH
                 edge_invariant_field=AtomicDataDict.EDGE_EMBEDDING_KEY,
                 node_invariant_field=AtomicDataDict.NODE_ATTRS_KEY,
             ),
+        ),
+        "edge_eng": (
+            ScalarMLP,
+            dict(field=EDGE_FEATURES, out_field=EDGE_ENERGY, mlp_output_dimension=1),
         ),
         # Sum edgewise energies -> per-atom energies:
         "per_atom_energy": (
