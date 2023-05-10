@@ -1,4 +1,5 @@
 from ._allegro import Allegro
+from ._allegro_nmr import Allegro_NMR
 from ._allegro_exp import AllegroExp
 from ._allegro_gibbs import AllegroGibbs
 from ._allegro_gibbs_deep import AllegroGibbsDeep
@@ -11,6 +12,7 @@ from ._scaling import PerSpeciesRescale, PerSpeciesGlobalRescale
 
 __all__ = [
     Allegro,
+    Allegro_NMR,
     AllegroExp,
     AllegroGibbs,
     AllegroGibbsDeep,
