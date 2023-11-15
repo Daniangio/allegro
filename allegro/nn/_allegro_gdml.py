@@ -49,10 +49,10 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
         cutoff_type: str = "polynomial",
         # general hyperparameters:
         field: str = AtomicDataDict.EDGE_ATTRS_KEY,
+        out_field: Optional[str] = _keys.EDGE_FEATURES,
         edge_invariant_field: str = AtomicDataDict.EDGE_EMBEDDING_KEY,
         node_invariant_field: str = AtomicDataDict.NODE_ATTRS_KEY,
         env_embed_multiplicity: int = 32,
-        embed_initial_edge: bool = True,
         linear_after_env_embed: bool = True,
         nonscalars_include_parity: bool = True,
         # MLP parameters:
@@ -65,7 +65,6 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
         latent_resnet: bool = True,
         latent_resnet_update_ratios: Optional[List[float]] = None,
         latent_resnet_update_ratios_learnable: bool = False,
-        linear_out_field: Optional[str] = _keys.EDGE_FEATURES,
         # Performance parameters:
         pad_to_alignment: int = 1,
         sparse_mode: Optional[str] = None,
@@ -82,7 +81,7 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
         self.num_layers = num_layers
         self.nonscalars_include_parity = nonscalars_include_parity
         self.field = field
-        self.linear_out_field = linear_out_field
+        self.out_field = out_field
         self.edge_invariant_field = edge_invariant_field
         self.node_invariant_field = node_invariant_field
         self.latent_resnet = latent_resnet
@@ -91,7 +90,6 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
         self.polynomial_cutoff_p = float(PolynomialCutoff_p)
         self.cutoff_type = cutoff_type
         assert cutoff_type in ("cosine", "polynomial")
-        self.embed_initial_edge = embed_initial_edge
         self.avg_num_neighbors = avg_num_neighbors
         self.linear_after_env_embed = linear_after_env_embed
         self.num_types = num_types
@@ -119,10 +117,10 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
 
         self.latents = torch.nn.ModuleList([])
         self.latents_to_weights = torch.nn.ModuleList([])
-        self.env_embed_mlps = torch.nn.ModuleList([])
-        self.tps = torch.nn.ModuleList([])
         self.linears = torch.nn.ModuleList([])
         self.env_linears = torch.nn.ModuleList([])
+        self.env_embed_mlps = torch.nn.ModuleList([])
+        self.tps = torch.nn.ModuleList([])
 
         # Embed to the spharm * it as mul
         input_irreps = self.irreps_in[self.field]
@@ -137,12 +135,8 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
         ) - env_embed_irreps.dim
         self.register_buffer("_zero", torch.zeros(1, 1))
 
-        # Initially, we have the B(r)Y(\vec{r})-projection of the edges
-        # (possibly embedded)
-        if self.embed_initial_edge:
-            arg_irreps = env_embed_irreps
-        else:
-            arg_irreps = input_irreps
+        # Initially, we have the B(r)Y(\vec{r})-projection of the embedded edges
+        arg_irreps = env_embed_irreps
 
         # - begin irreps -
         # start to build up the irreps for the iterated TPs
@@ -264,8 +258,6 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
                         (
                             (
                                 env_embed_multiplicity
-                                if layer_idx > 0 or self.embed_initial_edge
-                                else 1
                             ),
                             ir,
                         )
@@ -279,29 +271,19 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
                     [(env_embed_multiplicity, ir) for _, ir in full_out_irreps]
                 ),
                 instructions=instr,
-                # For the first layer, we have the unprocessed edges
-                # coming in from the input if `not self.embed_initial_edge`.
-                # These don't match the embedding in mul, so we have
-                # to use uvv --- since the input edges should be mul
-                # of one in normal circumstances, this is still plenty fast.
-                # For this reason it also doesn't increase the number of weights.
-                connection_mode=(
-                    "uuu" if layer_idx > 0 or self.embed_initial_edge else "uvv"
-                ),
+                connection_mode=("uuu"),
                 shared_weights=False,
                 has_weight=False,
                 pad_to_alignment=pad_to_alignment,
                 sparse_mode=sparse_mode,
             )
             self.tps.append(tp)
-            # we extract the scalars from the first irrep of the tp
-            # assert out_irreps[0].ir == SCALAR !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
             # Make env embed mlp
             generate_n_weights = (
                 self._env_weighter.weight_numel
             )  # the weight for the edge embedding
-            if layer_idx == 0 and self.embed_initial_edge:
+            if layer_idx == 0:
                 # also need weights to embed the edge itself
                 # this is because the 2 body latent is mixed in with the first layer
                 # in terms of code
@@ -442,12 +424,12 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
 
         self.register_parameter(
             "final_features_modulator",
-            torch.nn.Parameter(torch.as_tensor(1e2)),
+            torch.nn.Parameter(torch.as_tensor(1.)),
         )
 
         self.irreps_out.update(
             {
-                self.linear_out_field: o3.Irreps(
+                self.out_field: o3.Irreps(
                     [(1, (1, -1))]
                 ),
             }
@@ -505,7 +487,7 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
             edge_invariants,
         ]
         # The nonscalar features. Initially, the edge data.
-        features = edge_attr
+        features: torch.Tensor = edge_attr
 
         layer_index: int = 0
         # compute the sigmoids vectorized instead of each loop
@@ -531,13 +513,15 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
 
         # !!!! REMEMBER !!!! update final layer if update the code in main loop!!!
         # This goes through layer0, layer1, ..., layer_max-1
-        for latent, latent_to_weights, env_embed_mlp, env_linear, tp, linear in zip(
-            self.latents, self.latents_to_weights, self.env_embed_mlps, self.env_linears, self.tps, self.linears
+        for latent, latent_to_weights, env_embed_mlp, env_linear, linear, \
+            tp,  in zip(
+            self.latents, self.latents_to_weights, self.env_embed_mlps, self.env_linears, self.linears, \
+            self.tps,
         ):
             # Determine which edges are still in play
             cutoff_coeffs = cutoff_coeffs_all[layer_index]
-            prev_mask = cutoff_coeffs[active_edges] > 0
-            active_edges = (cutoff_coeffs > 0).nonzero().squeeze(-1)
+            prev_mask = cutoff_coeffs[active_edges] > -1e-3
+            active_edges = (cutoff_coeffs > -1e-3).nonzero().squeeze(-1)
 
             # Compute latents
             new_latents = latent(torch.cat(latent_inputs_to_cat, dim=-1)[prev_mask])
@@ -577,7 +561,7 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
             weights = env_embed_mlp(latents[active_edges])
             w_index: int = 0
 
-            if self.embed_initial_edge and layer_index == 0:
+            if layer_index == 0:
                 # embed initial edge
                 env_w = weights.narrow(-1, w_index, self._env_weighter.weight_numel)
                 w_index += self._env_weighter.weight_numel
@@ -598,8 +582,9 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
             # Those are the active edges, which are the only ones we
             # have weights for (env_w) anyway.
             # So we mask out the edges in the sum:
-            local_env_per_edge = scatter(
-                self._env_weighter(edge_attr[active_edges], env_w),
+            emb_latent = self._env_weighter(edge_attr[active_edges], env_w)
+            local_env_per_atom = scatter(
+                emb_latent,
                 edge_center[active_edges],
                 dim=0,
             )
@@ -612,11 +597,10 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
                 norm_const = self.env_sum_normalizations[
                     layer_index, data[AtomicDataDict.ATOM_TYPE_KEY]
                 ].unsqueeze(-1)
-            local_env_per_edge = local_env_per_edge * norm_const
-            local_env_per_edge = env_linear(local_env_per_edge)
+            local_env_per_atom = env_linear(local_env_per_atom * norm_const)
             # Copy to get per-edge
             # Large allocation, but no better way to do this:
-            local_env_per_edge = local_env_per_edge[edge_center[active_edges]]
+            local_env_per_edge = local_env_per_atom[edge_center[active_edges]]
 
             # Now do the TP
             # recursively tp current features with the environment embeddings
@@ -643,8 +627,8 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
 
         # final linear
         cutoff_coeffs = cutoff_coeffs_all[layer_index]
-        prev_mask = cutoff_coeffs[active_edges] > 0
-        active_edges = (cutoff_coeffs > 0).nonzero().squeeze(-1)
+        prev_mask = cutoff_coeffs[active_edges] > -1e-3
+        active_edges = (cutoff_coeffs > -1e-3).nonzero().squeeze(-1)
 
         linear_weights = self.final_latent_to_weights(
             torch.cat(latent_inputs_to_cat, dim=-1)[prev_mask]
@@ -655,6 +639,6 @@ class AllegroGDML_Module(GraphModuleMixin, torch.nn.Module):
         new_fetures = cutoff_coeffs[active_edges].unsqueeze(-1) * new_fetures
         
         final_features = torch.index_copy(final_features, 0, active_edges, new_fetures)
-        data[self.linear_out_field] = final_features * self.final_features_modulator
+        data[self.out_field] = final_features * self.final_features_modulator
 
         return data

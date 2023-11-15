@@ -6,27 +6,27 @@ from e3nn import o3
 from torch.utils.data import ConcatDataset
 
 from nequip.data import AtomicDataDict
-from nequip.nn import SequentialGraphNetwork
+from nequip.nn import SequentialGraphNetwork, AtomwiseReduce
 from nequip.nn.radial_basis import BesselBasis
 
 from nequip.nn.embedding import (
     OneHotAtomEncoding,
     SphericalHarmonicEdgeAttrs,
-    RadialBasisEdgeEncoding,
+    RadialBasisSquaredEdgeEncoding,
 )
-from nequip.nn._atomwise import AtomwiseLinear
 
 from allegro.nn import (
     NormalizedBasis,
-    EdgewiseForcesSum,
-    AllegroGDML_MACE_Module,
+    EdgewiseEnergySum,
+    Allegro_MACE_V2_Module,
+    ExponentialScalarMLPFunction,
 )
-from allegro._keys import EDGE_FEATURES, EDGE_FORCES
+from allegro._keys import EDGE_ENERGY
 
 from nequip.model import builder_utils
 
 
-def AllegroGDML_MACE(config, initialize: bool, dataset: Optional[ConcatDataset] = None):
+def Allegro_MACE_V2_sq(config, initialize: bool, dataset: Optional[ConcatDataset] = None):
     logging.debug("Building Allegro model...")
 
     # Handle avg num neighbors auto
@@ -57,9 +57,14 @@ def AllegroGDML_MACE(config, initialize: bool, dataset: Optional[ConcatDataset] 
     layers = {
         # -- Encode --
         # Get various edge invariants
-        "one_hot": OneHotAtomEncoding,
+        "one_hot": (
+            OneHotAtomEncoding,
+            dict(
+                node_input_features=config.get("node_input_features", [])
+            )
+        ),
         "radial_basis": (
-            RadialBasisEdgeEncoding,
+            RadialBasisSquaredEdgeEncoding,
             dict(
                 basis=(
                     NormalizedBasis
@@ -73,19 +78,30 @@ def AllegroGDML_MACE(config, initialize: bool, dataset: Optional[ConcatDataset] 
         "spharm": SphericalHarmonicEdgeAttrs,
         # The core allegro model:
         "allegro": (
-            AllegroGDML_MACE_Module,
+            Allegro_MACE_V2_Module,
             dict(
                 field=AtomicDataDict.EDGE_ATTRS_KEY,  # initial input is the edge SH
                 edge_invariant_field=AtomicDataDict.EDGE_EMBEDDING_KEY,
                 node_invariant_field=AtomicDataDict.NODE_ATTRS_KEY,
+                env_embed=ExponentialScalarMLPFunction,
             ),
         ),
-        "edge_f": (
-            AtomwiseLinear,
-            dict(field=EDGE_FEATURES, out_field=EDGE_FORCES),
+        # Sum edgewise energies -> per-atom energies:
+        "per_atom_energy": (
+            EdgewiseEnergySum,
+            dict(
+                field=EDGE_ENERGY,
+                out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY
+            ),
         ),
-        # Sum edgewise forces -> per-atom forces:
-        "node_f": EdgewiseForcesSum,
+        "total_energy_sum": (
+            AtomwiseReduce,
+            dict(
+                reduce="sum",
+                field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+                out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
+            ),
+        ),
     }
 
     model = SequentialGraphNetwork.from_parameters(shared_params=config, layers=layers)

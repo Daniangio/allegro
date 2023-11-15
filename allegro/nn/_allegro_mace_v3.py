@@ -2,9 +2,6 @@ from typing import Callable, Optional, List
 import math
 import functools
 
-# import os
-# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-
 import torch
 from torch_runstats.scatter import scatter
 
@@ -13,10 +10,13 @@ from e3nn.util.jit import compile_mode
 
 from nequip.data import AtomicDataDict
 from nequip.nn import GraphModuleMixin
+from nequip.utils.tp_utils import tp_path_exists
+
+from allegro._keys import CONTRIBUTIONS_KEY
 
 from ._fc import ScalarMLPFunction, ExponentialScalarMLPFunction
 from .. import _keys
-from ._strided import MakeWeightedChannels, Linear
+from ._strided import Contracter, MakeWeightedChannels, Linear
 from .cutoffs import cosine_cutoff, polynomial_cutoff
 
 from mace.modules.blocks import EquivariantProductBasisBlock
@@ -35,7 +35,7 @@ def pick_mpl_function(func):
 
 
 @compile_mode("script")
-class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
+class Allegro_MACE_V3_Module(GraphModuleMixin, torch.nn.Module):
     # saved params
     num_layers: int
     field: str
@@ -76,7 +76,7 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
         env_embed_kwargs={},
         two_body_latent=ScalarMLPFunction,
         two_body_latent_kwargs={},
-        latent=ScalarMLPFunction,
+        latent=ExponentialScalarMLPFunction,
         latent_kwargs={},
         latent_resnet: bool = True,
         latent_resnet_update_ratios: Optional[List[float]] = None,
@@ -85,6 +85,7 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
         feature_resnet_update_ratios_learnable: bool = True,
         # Performance parameters:
         pad_to_alignment: int = 1,
+        sparse_mode: Optional[str] = None,
         # Other:
         irreps_in=None,
     ):
@@ -138,17 +139,17 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
 
         self.latents = torch.nn.ModuleList([])
         self.env_embed_mlps = torch.nn.ModuleList([])
+        self.tps = torch.nn.ModuleList([])
         self.products = torch.nn.ModuleList([])
         self.reshape_back_modules = torch.nn.ModuleList([])
         self.linears = torch.nn.ModuleList([])
         self.env_linears = torch.nn.ModuleList([])
+        self.readouts = torch.nn.ModuleList([])
 
         # Embed to the spharm * it as mul
         input_irreps = self.irreps_in[self.field]
         # this is not inherant, but no reason to fix right now:
         assert all(mul == 1 for mul, ir in input_irreps)
-
-        # Environment builder:
         env_embed_irreps = o3.Irreps([(env_embed_multiplicity, ir) for _, ir in input_irreps])
         assert (
             env_embed_irreps[0].ir == SCALAR
@@ -158,6 +159,63 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
         ) - env_embed_irreps.dim
         self.register_buffer("_zero", torch.zeros(1, 1))
 
+        # Initially, we have the B(r)Y(\vec{r})-projection of the edges
+        # (possibly embedded)
+        arg_irreps = env_embed_irreps
+
+        # - begin irreps -
+        # start to build up the irreps for the iterated TPs
+        tps_irreps = [arg_irreps]
+
+        for layer_idx in range(num_layers):
+            ir_out = env_embed_irreps
+            # Create higher order terms cause there are more TPs coming
+            if layer_idx == self.num_layers - 1:
+                # ^ means we're doing the last layer
+                # No more TPs follow this, so only need scalars
+                ir_out = o3.Irreps([(1, (0, 1))])
+
+            # Prune impossible paths
+            ir_out = o3.Irreps(
+                [
+                    (mul, ir)
+                    for mul, ir in ir_out
+                    if tp_path_exists(arg_irreps, env_embed_irreps, ir)
+                ]
+            )
+
+            # the argument to the next tensor product is the output of this one
+            arg_irreps = ir_out
+            tps_irreps.append(ir_out)
+        # - end build irreps -
+
+        # == Remove unneeded paths ==
+        out_irreps = tps_irreps[-1]
+        new_tps_irreps = [out_irreps]
+        for arg_irreps in reversed(tps_irreps[:-1]):
+            new_arg_irreps = []
+            for mul, arg_ir in arg_irreps:
+                for _, env_ir in env_embed_irreps:
+                    if any(i in out_irreps for i in arg_ir * env_ir):
+                        # arg_ir is useful: arg_ir * env_ir has a path to something we want
+                        new_arg_irreps.append((mul, arg_ir))
+                        # once its useful once, we keep it no matter what
+                        break
+            new_arg_irreps = o3.Irreps(new_arg_irreps)
+            new_tps_irreps.append(new_arg_irreps)
+            out_irreps = new_arg_irreps
+
+        assert len(new_tps_irreps) == len(tps_irreps)
+        tps_irreps = list(reversed(new_tps_irreps))
+        del new_tps_irreps
+
+        assert tps_irreps[-1].lmax == 0
+
+        tps_irreps_in = tps_irreps[:-1]
+        tps_irreps_out = tps_irreps[1:]
+        del tps_irreps
+
+        # Environment builder:
         self._env_weighter = MakeWeightedChannels(
             irreps_in=input_irreps,
             multiplicity_out=env_embed_multiplicity,
@@ -166,18 +224,10 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
 
         self._n_scalar_outs: List[int] = []
 
-        # - begin irreps -
-        for layer_idx in range(self.num_layers):
-            # Make env embed mlp
-            generate_n_weights = (
-                self._env_weighter.weight_numel
-            )  # the weight for the edge embedding
-            if layer_idx == 0:
-                # also need weights to embed the edge itself
-                # this is because the 2 body latent is mixed in with the first layer
-                # in terms of code
-                generate_n_weights += self._env_weighter.weight_numel
-            
+        # == Build Products and TPs ==
+        for layer_idx, (arg_irreps, out_irreps) in enumerate(
+            zip(tps_irreps_in, tps_irreps_out)
+        ):
             # Make the env embed linear
             if self.linear_after_env_embed:
                 self.env_linears.append(
@@ -208,10 +258,68 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
             # Reshape back product so that you can perform tp
             self.reshape_back_modules.append(reshape_irreps(env_embed_irreps))
 
+            # Make TP
+            tmp_i_out: int = 0
+            instr = []
+            n_scalar_outs: int = 0
+            full_out_irreps = []
+            for i_out, (_, ir_out) in enumerate(out_irreps):
+                for i_1, (_, ir_1) in enumerate(arg_irreps):
+                    for i_2, (_, ir_2) in enumerate(env_embed_irreps):
+                        if ir_out in ir_1 * ir_2:
+                            if ir_out == SCALAR:
+                                n_scalar_outs += 1
+                            instr.append((i_1, i_2, tmp_i_out))
+                            full_out_irreps.append((env_embed_multiplicity, ir_out))
+                            tmp_i_out += 1
+            full_out_irreps = o3.Irreps(full_out_irreps)
+            self._n_scalar_outs.append(n_scalar_outs)
+            assert all(ir == SCALAR for _, ir in full_out_irreps[:n_scalar_outs])
+            tp = Contracter(
+                irreps_in1=o3.Irreps(
+                    [
+                        (
+                            (
+                                env_embed_multiplicity
+                            ),
+                            ir,
+                        )
+                        for _, ir in arg_irreps
+                    ]
+                ),
+                irreps_in2=o3.Irreps(
+                    [(env_embed_multiplicity, ir) for _, ir in env_embed_irreps]
+                ),
+                irreps_out=o3.Irreps(
+                    [(env_embed_multiplicity, ir) for _, ir in full_out_irreps]
+                ),
+                instructions=instr,
+                connection_mode=(
+                    "uuu"
+                ),
+                shared_weights=False,
+                has_weight=False,
+                pad_to_alignment=pad_to_alignment,
+                sparse_mode=sparse_mode,
+            )
+            self.tps.append(tp)
+            # we extract the scalars from the first irrep of the tp
+            assert out_irreps[0].ir == SCALAR
+
+            # Make env embed mlp
+            generate_n_weights = (
+                self._env_weighter.weight_numel
+            )  # the weight for the edge embedding
+            if layer_idx == 0:
+                # also need weights to embed the edge itself
+                # this is because the 2 body latent is mixed in with the first layer
+                # in terms of code
+                generate_n_weights += self._env_weighter.weight_numel
+
             # the linear acts after the extractor
             self.linears.append(
                 Linear(
-                    env_embed_irreps,
+                    full_out_irreps,
                     env_embed_irreps,
                     shared_weights=True,
                     internal_weights=True,
@@ -219,11 +327,8 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
                 )
             )
 
-            n_scalar_outs = sum([1 for _, ir in env_embed_irreps if ir.l == 0])
-            self._n_scalar_outs.append(n_scalar_outs)
-
             if layer_idx == 0:
-                # at the first layer, we have no invariants from previous products
+                # at the first layer, we have no invariants from previous TPs
                 self.latents.append(
                     two_body_latent(
                         mlp_input_dimension=(
@@ -246,7 +351,7 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
                             (
                                 # the embedded latent invariants from the previous layer(s)
                                 self.latents[-1].out_features
-                                # and the invariants extracted from the last layer's product:
+                                # and the invariants extracted from the last layer's TP:
                                 + env_embed_multiplicity * n_scalar_outs
                             )
                         ),
@@ -263,8 +368,15 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
                 )
             )
 
+            self.readouts.append(
+                latent(
+                    mlp_input_dimension=self.latents[-1].out_features,
+                    mlp_output_dimension=1,
+                )
+            )
+
         # For the final layer, we specialize:
-        # we don't need to propagate nonscalars, so there is no product
+        # we don't need to propagate nonscalars, so there is no TP
         # thus we only need the latent:
         self.final_latent = latent(
             mlp_input_dimension=self.latents[-1].out_features
@@ -281,7 +393,7 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
                     pad_to_alignment=pad_to_alignment,
                 )
 
-        self.readout = latent(
+        self.final_readout = latent(
             mlp_input_dimension=self.latents[-1].out_features,
             mlp_output_dimension=1,
         )
@@ -367,7 +479,7 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
         self.irreps_out.update(
             {
                 self.out_field: o3.Irreps(
-                    [(1, (0, 1))]
+                    [(self.final_readout.out_features, (0, 1))]
                 ),
             }
         )
@@ -412,8 +524,6 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
             device=edge_attr.device,
         )
 
-        # For the first layer, we use the input invariants:
-        # The center and neighbor invariants and edge invariants
         latent_inputs_to_cat = [
             node_invariants[edge_center],
             node_invariants[edge_neighbor],
@@ -440,18 +550,14 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
                 edge_length, self.per_layer_cutoffs, p=self.polynomial_cutoff_p
             )
         else:
-            # This branch is unreachable (cutoff type is checked in __init__)
-            # But TorchScript doesn't know that, so we need to make it explicitly
-            # impossible to make it past so it doesn't throw
-            # "cutoff_coeffs_all is not defined in the false branch"
             assert False, "Invalid cutoff type"
 
-        # !!!! REMEMBER !!!! update final layer if update the code in main loop!!!
-        # This goes through layer0, layer1, ..., layer_max-1
+        out_field_list = []
+
         for latent, env_embed_mlp, env_linear, linear, \
-            prod, reshape_back in zip(
+            prod, reshape_back, readout, tp in zip(
             self.latents, self.env_embed_mlps, self.env_linears, self.linears, \
-            self.products, self.reshape_back_modules,
+            self.products, self.reshape_back_modules, self.readouts, self.tps
         ):
             # Determine which edges are still in play
             cutoff_coeffs = cutoff_coeffs_all[layer_index]
@@ -460,27 +566,12 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
 
             # Compute latents
             new_latents = latent(torch.cat(latent_inputs_to_cat, dim=-1)[prev_mask])
-            # Apply cutoff, which propagates through to everything else
             new_latents = cutoff_coeffs[active_edges].unsqueeze(-1) * new_latents
 
             if self.latent_resnet and layer_index > 0:
                 this_layer_update_coeff = layer_update_coefficients[layer_index - 1]
-                # At init, we assume new and old to be approximately uncorrelated
-                # Thus their variances add
-                # we always want the latent space to be normalized to variance = 1.0,
-                # because it is critical for learnability. Still, we want to preserve
-                # the _relative_ magnitudes of the current latent and the residual update
-                # to be controled by `this_layer_update_coeff`
-                # Solving the simple system for the two coefficients:
-                #   a^2 + b^2 = 1  (variances add)   &    a * this_layer_update_coeff = b
-                # gives
-                #   a = 1 / sqrt(1 + this_layer_update_coeff^2)  &  b = this_layer_update_coeff / sqrt(1 + this_layer_update_coeff^2)
-                # rsqrt is reciprocal sqrt
                 coefficient_old = torch.rsqrt(this_layer_update_coeff.square() + 1)
                 coefficient_new = this_layer_update_coeff * coefficient_old
-                # Residual update
-                # Note that it only runs when there are latents to resnet with, so not at the first layer
-                # index_add adds only to the edges for which we have something to contribute
                 latents = torch.index_add(
                     coefficient_old * latents,
                     0,
@@ -488,23 +579,21 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
                     coefficient_new * new_latents,
                 )
             else:
-                # Normal (non-residual) update
-                # index_copy replaces, unlike index_add
                 latents = torch.index_copy(latents, 0, active_edges, new_latents)
+
+            out_field_list.append(readout(latents[active_edges]))
 
             # From the latents, compute the weights for active edges:
             weights = env_embed_mlp(latents[active_edges])
             w_index: int = 0
 
             if layer_index == 0:
-                # embed initial edge
                 env_w = weights.narrow(-1, w_index, self._env_weighter.weight_numel)
                 w_index += self._env_weighter.weight_numel
                 features_old = self._env_weighter(
                     features[prev_mask], env_w
-                )  # features is edge_attr
+                )
             else:
-                # just take the previous features that we still need
                 features_old = features[prev_mask]
 
             # Extract weights for the environment builder
@@ -512,13 +601,33 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
             w_index += self._env_weighter.weight_numel
 
             # Build the local environments
-            # This local environment should only be a sum over neighbors
-            # who are within the cutoff of the _current_ layer
-            # Those are the active edges, which are the only ones we
-            # have weights for (env_w) anyway.
-            # So we mask out the edges in the sum:
-            features_new = self._env_weighter(edge_attr[active_edges], env_w)
+            local_env_per_edge = self._env_weighter(edge_attr[active_edges], env_w)
+            local_env_per_atom = scatter(
+                local_env_per_edge,
+                edge_center[active_edges],
+                dim=0,
+            )
+            if self.env_sum_normalizations.ndim < 2:
+                norm_const = self.env_sum_normalizations[layer_index]
+            else:
+                norm_const = self.env_sum_normalizations[
+                    layer_index, data[AtomicDataDict.ATOM_TYPE_KEY]
+                ].unsqueeze(-1)
+
+            expanded_features_per_atom: torch.Tensor = prod(
+                node_feats=local_env_per_atom * norm_const, sc=None, node_attrs=node_invariants[:edge_center[active_edges].max() + 1]
+            )
+
+            expanded_features_per_atom = reshape_back(expanded_features_per_atom)
+            expanded_features_per_atom = env_linear(expanded_features_per_atom)
+            features_new = expanded_features_per_atom[edge_center[active_edges]]
+
+            # do the TP
             features_old = features_old.reshape(features_new.shape[0], features_new.shape[1], -1)
+            features_new = tp(features_old, features_new)
+
+            # do the linear
+            features_new = linear(features_new)
 
             this_layer_update_coeff = layer_feature_update_coefficients[layer_index - 1]
             coefficient_old = torch.rsqrt(this_layer_update_coeff.square() + 1)
@@ -531,56 +640,17 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
                 coefficient_new * features_new,
             )
 
-            local_env_per_atom = scatter(
-                features,
-                edge_center[active_edges],
-                dim=0,
-            )
-            if self.env_sum_normalizations.ndim < 2:
-                # it's a scalar per layer
-                norm_const = self.env_sum_normalizations[layer_index]
-            else:
-                # it's per type
-                # get shape [N_atom, 1] for broadcasting
-                norm_const = self.env_sum_normalizations[
-                    layer_index, data[AtomicDataDict.ATOM_TYPE_KEY]
-                ].unsqueeze(-1)
-            local_env_per_atom = env_linear(local_env_per_atom * norm_const)
-
-            expanded_features_per_atom: torch.Tensor = prod(
-                node_feats=local_env_per_atom, sc=None, node_attrs=node_invariants[:edge_center[active_edges].max() + 1]
-            )
-
-            expanded_features_per_atom = reshape_back(expanded_features_per_atom)
-
-            # Copy to get per-edge
-            # Large allocation, but no better way to do this:
-            features = expanded_features_per_atom[edge_center[active_edges]]
-
             # Get invariants
-            # features has shape [z][mul][k]
-            # we know scalars are first
             scalars = features[:, :, : self._n_scalar_outs[layer_index]].reshape(
                 features.shape[0], -1
             )
-
-            # do the linear
-            features = linear(features)
-
-            # For layer2+, use the previous latents and scalars
-            # This makes it deep
             latent_inputs_to_cat = [
                 latents[active_edges],
                 scalars,
             ]
-
-            # increment counter
             layer_index += 1
 
         # - final layer -
-        # due to TorchScript limitations, we have to
-        # copy and repeat the code here --- no way to
-        # escape the final iteration of the loop early
         cutoff_coeffs = cutoff_coeffs_all[layer_index]
         prev_mask = cutoff_coeffs[active_edges] > -1e-3
         active_edges = (cutoff_coeffs > -1e-3).nonzero().squeeze(-1)
@@ -600,8 +670,11 @@ class Allegro_MACE_Module(GraphModuleMixin, torch.nn.Module):
             )
         else:
             latents = torch.index_copy(latents, 0, active_edges, new_latents)
-
         # - end final layer -
-        data[self.out_field] = self.readout(latents)
+        out_field_list.append(self.final_readout(latents))
+        contributions = torch.stack(out_field_list, dim=-1)
+
+        data[CONTRIBUTIONS_KEY] = contributions
+        data[self.out_field] = torch.sum(contributions, dim=-1)
 
         return data
